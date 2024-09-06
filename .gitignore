@@ -1,0 +1,7 @@
+.venv
+__pycache__
+coco-caption
+data
+modules/__pycache__
+multi_frame_results
+visualizations
