@@ -234,9 +234,45 @@ class SubNetwork(nn.Module):
             x = layer(x)
         return x
 
+class NeuromodulatorNetwork(nn.Module):
+    def __init__(self, input_dim, num_subnetworks):
+        super(NeuromodulatorNetwork, self).__init__()
+        hidden_dims = [256, 128]
+        self.num_subnetworks = num_subnetworks
+        self.fc = FullyConnected(input_dim, hidden_dims, num_subnetworks)  # Output 1 dopamine signal per subnetwork
+        self.tanh = nn.Tanh()  # Output will be restricted between -1 and 1
+
+    def forward(self, activations):
+        dopamine_signals = self.fc(activations.detach())  # Shape: (batch_size, num_subnetworks)
+        return self.tanh(dopamine_signals.mean(dim=0))  # Dopamine signals per subnetwork, Averaging across batch dimension, final shape: (num_subnetworks,)
+
+class ExpectationRewardNetwork(nn.Module):
+    def __init__(self, input_dim, num_subnetworks, device='cuda'):
+        super(ExpectationRewardNetwork, self).__init__()
+        # input_dim will include both activations and dopamine signals from all subnetworks
+        total_input_dim = input_dim + num_subnetworks  # Add the number of dopamine signals to input dimension
+        hidden_dims = [256, 128]  # Can be adjusted based on the use case
+        
+        # Fully connected layers for the expectation-reward prediction
+        self.fc = FullyConnected(total_input_dim, hidden_dims, 1)  # Output a scalar reward prediction
+        self.device = device
+
+    def forward(self, activations, dopamine_signals):
+        # Concatenate activations and dopamine signals for all subnetworks
+        activations = activations.detach()
+        batch_size = activations.size(0)
+
+        dopamine_signals = dopamine_signals.repeat(batch_size, 1)  # Shape: (batch_size, num_subnetworks)
+        combined_input = torch.cat([activations, dopamine_signals], dim=-1)  # Shape: (batch_size, input_dim + num_subnetworks)
+        
+        # Pass through the fully connected layers to predict reward
+        reward_prediction = self.fc(combined_input)
+        return reward_prediction.mean(dim=0)
+
+
 # 7. Neural Memory Network
 class NeuralMemoryNetwork(nn.Module):
-    def __init__(self, num_subnetworks, num_layers):
+    def __init__(self, num_subnetworks, num_layers, device='cuda'):
         super(NeuralMemoryNetwork, self).__init__()
         self.subnetworks = nn.ModuleList()
         self.hidden_size = INTERNAL_DIM // num_subnetworks
@@ -253,6 +289,31 @@ class NeuralMemoryNetwork(nn.Module):
 
         self.prev_loss = None
         self.activations = None
+
+        # Initialize neuromodulator and expectation-reward networks
+        self.neuromodulator = NeuromodulatorNetwork(INTERNAL_DIM, num_subnetworks)  # One dopamine signal per subnetwork
+        self.expectation_reward_network = ExpectationRewardNetwork(INTERNAL_DIM, num_subnetworks)  # Takes activations + dopamine
+        self.dopamine_signals = None  # Cache dopamine signals
+
+        self.device = device
+
+
+    def update_neural_modulators(self):
+        """
+        This function will be called before the forward pass to modulate alpha values of each subnetwork.
+        The dopamine signals are computed using the neuromodulator network based on the activations of the previous step.
+        """
+        if self.activations is not None:
+            # Compute dopamine signals using the neuromodulator network
+            self.dopamine_signals = self.neuromodulator(self.activations)  # (batch_size, num_subnetworks)
+
+            # Update alpha values in each subnetwork's Hebbian layers
+            for i, subnetwork in enumerate(self.subnetworks):
+                for layer in subnetwork.layers:
+                    layer.alpha.data += self.dopamine_signals[i]  # Modulate alpha with dopamine signal
+        else:
+            # Initialize dopamine signals as zeros if this is the first step
+            self.dopamine_signals = torch.zeros(1, self.num_subnetworks,device=self.device)
 
     def forward(self, x):
         batch_size = x.size(0)  # (batch_size, INTERNAL_DIM)
@@ -271,6 +332,11 @@ class NeuralMemoryNetwork(nn.Module):
         final_output = self.layer_norm(final_output)  # (batch_size, INTERNAL_DIM)
         self.activations = final_output
         return final_output
+    
+    def compute_expected_reward(self):
+        # Use the expectation-reward network to compute the predicted quality of the dopamine signals
+        predicted_reward = self.expectation_reward_network(self.activations, self.dopamine_signals)
+        return predicted_reward
 
 
 # 9. textual Feature Adaptor
@@ -323,7 +389,19 @@ class Brain(nn.Module):
         # Attention mechanism
         self.attention = AttentionModule(embed_dim=INTERNAL_DIM, num_heads=8)
 
+    def update_neural_modulators(self):
+        """Update the neuromodulators for each NMN before the forward pass."""
+        for nmn in self.neural_memory_networks:
+            nmn.update_neural_modulators()
 
+    def get_predicted_dopamine_quality(self):
+        """Get the predicted dopamine signal quality for each NMN."""
+        dopamine_qualities = []
+        for nmn in self.neural_memory_networks:
+            dopamine_quality = nmn.compute_expected_reward()  # Returns the predicted quality of dopamine signals
+            dopamine_qualities.append(dopamine_quality)
+        return torch.stack(dopamine_qualities)
+    
     def forward(self, imgs, cls_tokens):
         # print("in brain forward")
         # process peripheral vision for all cameras

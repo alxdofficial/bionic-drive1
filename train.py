@@ -63,9 +63,28 @@ def plot_loss(training_loss, val_loss):
     plt.legend()
     plt.savefig(os.path.join('multi_frame_results', timestr, 'loss.png'))
 
+
+def expectation_reward_criteria(batch_loss, predicted_quality):
+    """Calculates the difference between the negative of batch loss and predicted dopamine quality."""
+    return torch.abs(-batch_loss - predicted_quality)
+
+def neuromodulator_criteria(predicted_quality):
+    """Criteria for the neuromodulator, aiming to minimize the predicted dopamine quality."""
+    return -predicted_quality
+
 def custom_train(train_loss, val_loss, best_model, epochs, learning_rate):
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9, last_epoch=-1, verbose=False)
+
+    # Separate optimizers for neuromodulator and expectation-reward networks
+    modulator_optimizer = torch.optim.AdamW(
+        [param for nmn in model.mvp.img_model.neural_memory_networks for param in nmn.neuromodulator.parameters()],
+        lr=learning_rate
+    )
+    expectation_reward_optimizer = torch.optim.AdamW(
+        [param for nmn in model.mvp.img_model.neural_memory_networks for param in nmn.expectation_reward_network.parameters()],
+        lr=learning_rate
+    )
 
     for epoch in range(epochs, config.epochs):
         print('-------------------- EPOCH ' + str(epoch) + ' ---------------------')
@@ -73,6 +92,9 @@ def custom_train(train_loss, val_loss, best_model, epochs, learning_rate):
         epoch_loss = 0
 
         i = 0
+        modulator_steps, expectation_steps = 0, 0
+        cycle_length = 10
+
         for step, (inputs, imgs, labels) in tqdm(enumerate(train_dataloader), total=len(train_dataloader)):
             i += 1
             # if i % 100 == 0 or i == 1:
@@ -81,13 +103,54 @@ def custom_train(train_loss, val_loss, best_model, epochs, learning_rate):
                 gc.collect()  # Collect garbage to free CPU memory
                 torch.cuda.empty_cache()  # Free up GPU memory
             # print(inputs.shape, imgs.shape, labels.shape)
-           
+
+            with torch.no_grad():
+                model.mvp.img_model.update_neural_modulators()
+
             # Forward pass through model
             outputs = model(inputs, imgs, labels)
 
             # Calculate loss
             loss = outputs.loss
             epoch_loss += loss.item()
+
+            # Back-propogate
+            loss.backward()
+            # zero out gradeints of hebbian params that shouldnt be updated using backprop
+            for name, param in model.named_parameters():
+                if 'hebbian_weights' in name or 'hebbian_recurrent_weights' in name or 'neuromodulator' in name or 'expectation_reward_network' in name:
+                    param.grad = None  # Freeze neuromodulator and expectation-reward networks during brain backprop
+
+            optimizer.step()
+            optimizer.zero_grad()
+
+            # Detach the loss before calculating modulator loss and reward loss
+            detached_loss = loss.detach()
+
+             # Get the predicted dopamine quality from the neural memory network
+            predicted_quality = model.mvp.img_model.get_predicted_dopamine_quality()
+
+            # Calculate the losses for the neuromodulator and expectation-reward networks and optimize them depending on what phase it is
+            if modulator_steps < cycle_length:
+                modulator_loss = neuromodulator_criteria(predicted_quality).mean()
+                # Optimize the neuromodulator network
+                modulator_optimizer.zero_grad()
+                modulator_loss.backward()
+                modulator_optimizer.step()
+                modulator_steps += 1
+
+            elif expectation_steps < cycle_length:
+                reward_loss = expectation_reward_criteria(detached_loss, predicted_quality).mean()
+                # Optimize the expectation-reward network
+                expectation_reward_optimizer.zero_grad()
+                reward_loss.backward()
+                expectation_reward_optimizer.step()
+                expectation_steps += 1
+
+            # After cycle_length steps, reset the counters for modulator and expectation-reward training
+            if modulator_steps == cycle_length and expectation_steps == cycle_length:
+                modulator_steps, expectation_steps = 0, 0
+
 
             if step % config.checkpoint_frequency == 0:
                 print()
@@ -113,17 +176,7 @@ def custom_train(train_loss, val_loss, best_model, epochs, learning_rate):
                     print('Ground Truth Answers:')
                     print(text_labels)
                 except:
-                    print("printout qa example errored out")
-
-            # Back-propogate
-            loss.backward()
-            # zero out gradeints of hebbian params that shouldnt be updated using backprop
-            for name, param in model.named_parameters():
-                if 'hebbian_weights' in name or 'hebbian_recurrent_weights' in name:
-                    param.grad = None
-            optimizer.step()
-            optimizer.zero_grad()
-                
+                    print("printout qa example errored out")    
 
         # Get train and val loss per batch
         epoch_train_loss = epoch_loss / len(train_dataloader)
