@@ -48,23 +48,26 @@ class FullyConnected(nn.Module):
         return self.fc(x)
 
 # takes in an embedding of peripheral vision and one cls token, predicts x and y coordinate of fovea as percent
+# and predicts which image out of 6 to focus on
 class FoveaPosPredictor(nn.Module):
     def __init__(self, dropout=0.3):
         super(FoveaPosPredictor, self).__init__()
         hidden_dims = [256, 128, 32]
-        self.fc = FullyConnected(INTERNAL_DIM + INTERNAL_DIM, hidden_dims, 2)
-        self.sigmoid = nn.Sigmoid()
+        self.fc = FullyConnected(INTERNAL_DIM + INTERNAL_DIM, hidden_dims, 8)  # 2 for x,y and 6 for image selection
+        self.sigmoid = nn.Sigmoid()  # For x and y coordinates
+        self.softmax = nn.Softmax(dim=-1)  # For image selection (6 cameras)
+
     def forward(self, peripheral_embedding, cls_token):
         # Concatenate peripheral image encoding and CLS token along the last dimension
-        # print(f"in fovea pos pred forward, periph embedding shape: ", peripheral_embedding.shape)
-        # print(f"in fovea pos pred forward, cls token shape: ", cls_token.shape)
         combined_input = torch.cat((peripheral_embedding, cls_token), dim=-1)
-        # Pass the concatenated tensor through the fully connected layers
         output = self.fc(combined_input)
-        # Apply sigmoid activation to ensure the output values are between 0 and 1
-        output = self.sigmoid(output)
+        
+        # Separate the output into fovea coordinates and image selection
+        fovea_coords = self.sigmoid(output[:, :2])  # 2D coordinates normalized between 0 and 1
+        image_selection = self.softmax(output[:, 2:])  # Softmax over 6 cameras
 
-        return output
+        return fovea_coords, image_selection
+
 
 # 3. Vision Encoder
 class VisionEncoder(nn.Module):
@@ -157,43 +160,42 @@ class HebbianLayer(nn.Module):
 
         # Store previous activations
         self.previous_activation = None
-        self.previous_recurrent_activation = None
 
-    def forward(self, x):
+    def forward(self, stimulus):
         with torch.no_grad():
-            batch_size = x.size(0)
+            batch_size = stimulus.size(0)
             
             # Initialize previous activations if they are not set
             if self.previous_activation is None:
                 self.previous_activation = torch.zeros(batch_size, self.dim, device=self.device)
-                self.previous_recurrent_activation = torch.zeros(batch_size, self.dim, device=self.device)
 
-            # Compute recurrent input
-            recurrent_input = torch.matmul(self.previous_activation, self.hebbian_recurrent_weights)  # (batch_size, dim)
-            recurrent_input = self.layer_norm_recurrent(recurrent_input)
+            # Compute recurrent output
+            recurrent_input = self.previous_activation
+            recurrent_output = torch.matmul(recurrent_input, self.hebbian_recurrent_weights)  # (batch_size, dim)
+            recurrent_output_norm = self.layer_norm_recurrent(recurrent_output)
             
             # Compute activations
-            activations = F.relu(torch.matmul(x, self.hebbian_weights) + recurrent_input)
-            activations = self.layer_norm_activations(activations)
+            stimulus_output = torch.matmul(stimulus, self.hebbian_weights) 
+            final_output = F.relu(stimulus_output + recurrent_output_norm)
+            final_output = self.layer_norm_activations(final_output)
 
             # Update previous activations
-            self.previous_activation = activations.detach()
-            self.previous_recurrent_activation = recurrent_input.detach()
+            self.previous_activation = final_output
 
             # Perform Hebbian update
-            self.hebbian_update(recurrent_input, x)
+            self.hebbian_update(recurrent_input, recurrent_output, stimulus, stimulus_output)
 
-            return activations
+            return final_output
 
-    def hebbian_update(self, recurrent_input, x):
+    def hebbian_update(self, recurrent_input, recurrent_output, stimulus, stimulus_output):
         with torch.no_grad():
             # Standard Hebbian update rule for regular weights
             # Input: recurrent_input, Output: self.previous_activation
-            hebbian_updates = torch.einsum('bi,bj->ij', recurrent_input, self.previous_activation)
+            hebbian_updates = torch.einsum('bi,bj->ij', stimulus, stimulus_output)
 
             # Standard Hebbian update rule for recurrent weights
             # Input: x, Output: self.previous_recurrent_activation
-            recurrent_hebbian_updates = torch.einsum('bi,bj->ij', x, self.previous_recurrent_activation)
+            recurrent_hebbian_updates = torch.einsum('bi,bj->ij', recurrent_input, recurrent_output)
 
             # Modulate updates with alpha (learning rate)
             hebbian_updates = hebbian_updates * self.alpha.unsqueeze(0)  # Shape: (dim, dim)
@@ -337,16 +339,6 @@ class NeuralMemoryNetwork(nn.Module):
         # Use the expectation-reward network to compute the predicted quality of the dopamine signals
         predicted_reward = self.expectation_reward_network(self.activations, self.dopamine_signals)
         return predicted_reward
-
-
-# 9. textual Feature Adaptor
-class TextualFeatureAdaptor(nn.Module):
-    def __init__(self, input_size, output_size):
-        super(TextualFeatureAdaptor, self).__init__()
-        self.fc = nn.Linear(input_size, output_size)
-
-    def forward(self, x):
-        return F.relu(self.fc(x))
     
 # 10. Attention Module
 class AttentionModule(nn.Module):
@@ -387,7 +379,12 @@ class Brain(nn.Module):
         ])
 
         # Attention mechanism
-        self.attention = AttentionModule(embed_dim=INTERNAL_DIM, num_heads=8)
+        self.attention = AttentionModule(embed_dim=INTERNAL_DIM, num_heads=4)
+        # Linear layer to project positional encoding to match INTERNAL_DIM
+        self.positional_encoder = nn.Linear(8, INTERNAL_DIM)  # 8: 2 for coordinates, 6 for one-hot image index
+        # LayerNorm for peripheral and fovea encodings after positional encoding
+        self.peripheral_norm = nn.LayerNorm(INTERNAL_DIM)
+        self.fovea_norm = nn.LayerNorm(INTERNAL_DIM)
 
     def update_neural_modulators(self):
         """Update the neuromodulators for each NMN before the forward pass."""
@@ -403,47 +400,89 @@ class Brain(nn.Module):
         return torch.stack(dopamine_qualities)
     
     def forward(self, imgs, cls_tokens):
-        # print("in brain forward")
-        # process peripheral vision for all cameras
+        batch_size = imgs[0].size(0)  # Get batch size from the first image
+
+        # Process peripheral vision for all images with positional encoding
         peripheral_encodings = []
         for i, img in enumerate(imgs):
-            # print(f"in brain forward, imgs[{i}] shape: ", img.shape)
             peripheral_encoding = self.vision_encoder.forward_peripheral(img)
-            # print(f"in brain forward, periph encoding shape: ", peripheral_encoding.shape)
+
+            # Use 0s for fovea coordinates as a placeholder
+            zero_fovea_coords = torch.zeros(batch_size, 2, device=img.device)
+
+            # Create a tensor for the selected image index, shaped (batch_size,)
+            selected_img_idx = torch.full((batch_size,), i, device=img.device, dtype=torch.long)
+
+            # Add positional encoding and normalize
+            pos_encoding = self.add_positional_encoding(zero_fovea_coords, selected_img_idx)
+            peripheral_encoding = peripheral_encoding + pos_encoding
+            peripheral_encoding = self.peripheral_norm(peripheral_encoding)  # Apply LayerNorm
+
             peripheral_encodings.append(peripheral_encoding)
-        # print("peripheral embeddings made")
-        # Combine encodings of images peripheral
+
+        # Combine peripheral encodings with attention
         peripheral_combined = self.attention(peripheral_encodings[0], peripheral_encodings[1:])
-        # print("peripheral embeddings combined")
-        # store all memory network outputs here
-        final_outputs_of_all_memory_networks = []
-        
-        # write peripheral vision experience to memory
-        for nmn in self.neural_memory_networks:
-            final_outputs_of_all_memory_networks.append(nmn(peripheral_combined))
-        # print("peripheral embeddings written to memory")
+
+        # Store memory network outputs
+        final_outputs_of_all_memory_networks = [
+            nmn(peripheral_combined) for nmn in self.neural_memory_networks
+        ]
+
         # Process fovea vision using CLS tokens
-        for cls in cls_tokens:
-            fovea_encodings = []
-            for i, img in enumerate(imgs):
-                # Predict fovea x and y coordinates
-                fovea_coords = self.fovea_loc_pred(peripheral_encodings[i], cls)
-                # Process fovea using the predicted coordinates
-                fovea_encoding = self.vision_encoder.forward_fovea(img, fovea_coords)
-                # print(f"in brain forward, fovea encoding shape: ", fovea_encoding.shape)
-                fovea_encodings.append(fovea_encoding)
+        fovea_encodings = []
+        for i, cls in enumerate(cls_tokens):
+            # Predict fovea coordinates and the target image index
+            if i == 0:
+                fovea_coords_logits, img_selector_logits = self.fovea_loc_pred(peripheral_combined, cls)
+            else:
+                fovea_coords_logits, img_selector_logits = self.fovea_loc_pred(fovea_encodings[-1], cls)
 
-            # Combine fovea encodings using the attention module
-            fovea_combined = self.attention(fovea_encodings[0], fovea_encodings[1:])
-            # print(f"in brain forward, fovea combined shape: ", fovea_combined.shape)
-            # Pass the combined fovea encoding into neural memory networks
+            img_selector_probs = F.softmax(img_selector_logits, dim=-1)
+            selected_img_idx = torch.argmax(img_selector_probs, dim=-1)
+
+            # Select images for each batch element based on predicted index
+            selected_img = torch.cat([
+                imgs[selected_img_idx[b].item()][b].unsqueeze(0) for b in range(batch_size)
+            ], dim=0)
+
+            # Process fovea encoding using the selected image
+            fovea_encoding = self.vision_encoder.forward_fovea(selected_img, fovea_coords_logits)
+
+            # Add positional encoding and normalize
+            fovea_encoding_with_pos = fovea_encoding + self.add_positional_encoding(
+                fovea_coords_logits, selected_img_idx
+            )
+            fovea_encoding_with_pos = self.fovea_norm(fovea_encoding_with_pos)  # Apply LayerNorm
+
+            fovea_encodings.append(fovea_encoding_with_pos)
+
+            # Pass the fovea encoding through memory networks
             for nmn in self.neural_memory_networks:
-                nmn_output = nmn(fovea_combined)
+                nmn_output = nmn(fovea_encoding_with_pos)
                 final_outputs_of_all_memory_networks.append(nmn_output)
-            # print("fovea embeddings written to memory")
 
-        # Stack the outputs along a new sequence dimension
-        final_outputs_of_all_memory_networks = torch.stack(final_outputs_of_all_memory_networks, dim=1)  # (batch, seqlen, dim)
-        # print("returning all memory outputs")
+        # Stack all memory network outputs along a sequence dimension
+        final_outputs_of_all_memory_networks = torch.stack(final_outputs_of_all_memory_networks, dim=1)
 
         return final_outputs_of_all_memory_networks
+
+    def add_positional_encoding(self, fovea_coords, selected_img_idx):
+        # Add positional encoding for the fovea coordinates and selected image index
+        batch_size = fovea_coords.size(0)
+
+        # Ensure selected_img_idx is a tensor
+        selected_img_idx = selected_img_idx.unsqueeze(-1)  # Ensure it has the right dimensions
+        
+        # One-hot encode the selected image index and remove the extra dimension (from 3D to 2D)
+        one_hot_img_idx = F.one_hot(selected_img_idx, num_classes=6).float().squeeze(1)  # Shape: (batch_size, 6)
+
+        # Combine fovea coordinates with the selected image index (one-hot encoded)
+        fovea_encoding_pos = torch.cat([
+            fovea_coords,  # Fovea coordinates as position (2D)
+            one_hot_img_idx  # One-hot encode the selected image index (6 images)
+        ], dim=-1)  # Final size: (batch_size, 8)
+
+        # Project positional encoding to the same dimension as INTERNAL_DIM
+        positional_encoding_proj = self.positional_encoder(fovea_encoding_pos)  # Shape: (batch_size, INTERNAL_DIM)
+
+        return positional_encoding_proj

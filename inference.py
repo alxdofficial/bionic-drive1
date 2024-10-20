@@ -5,8 +5,8 @@ import torch
 from pycocotools.coco import COCO
 from pycocoevalcap.eval import COCOEvalCap
 import os
-from modules.multi_frame_dataset import MultiFrameDataset
-from modules.multi_frame_model import DriveVLMT5
+from modules.dataset import Dataset
+from modules.model import DriveVLMT5
 from tqdm import tqdm as progress_bar
 from transformers import T5Tokenizer
 from torch.utils.data import DataLoader
@@ -117,7 +117,7 @@ if __name__ == '__main__':
     model.to(device)
     
     # Load dataset and dataloader
-    test_dset = MultiFrameDataset(
+    test_dset = Dataset(
         input_file=os.path.join('data', 'inference',
                                 'filtered_sorted_multi_frame_val.json'),
         tokenizer=processor,

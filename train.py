@@ -6,8 +6,8 @@ import time
 from torch.utils.data import DataLoader
 import torch
 import argparse
-from modules.multi_frame_dataset import MultiFrameDataset
-from modules.multi_frame_model import print_trainable_parameters, DriveVLMT5
+from modules.dataset import Dataset
+from modules.model import print_trainable_parameters, DriveT5VisionModel
 import matplotlib.pyplot as plt
 import pandas as pd
 from copy import deepcopy
@@ -72,17 +72,17 @@ def neuromodulator_criteria(predicted_quality):
     """Criteria for the neuromodulator, aiming to minimize the predicted dopamine quality."""
     return -predicted_quality
 
-def custom_train(train_loss, val_loss, best_model, epochs, learning_rate):
+def train(train_loss, val_loss, best_model, epochs, learning_rate):
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9, last_epoch=-1, verbose=False)
 
     # Separate optimizers for neuromodulator and expectation-reward networks
     modulator_optimizer = torch.optim.AdamW(
-        [param for nmn in model.mvp.img_model.neural_memory_networks for param in nmn.neuromodulator.parameters()],
+        [param for nmn in model.image_processor.visual_embedding_module.neural_memory_networks for param in nmn.neuromodulator.parameters()],
         lr=learning_rate
     )
     expectation_reward_optimizer = torch.optim.AdamW(
-        [param for nmn in model.mvp.img_model.neural_memory_networks for param in nmn.expectation_reward_network.parameters()],
+        [param for nmn in model.image_processor.visual_embedding_module.neural_memory_networks for param in nmn.expectation_reward_network.parameters()],
         lr=learning_rate
     )
 
@@ -105,7 +105,7 @@ def custom_train(train_loss, val_loss, best_model, epochs, learning_rate):
             # print(inputs.shape, imgs.shape, labels.shape)
 
             with torch.no_grad():
-                model.mvp.img_model.update_neural_modulators()
+                model.image_processor.visual_embedding_module.update_neural_modulators()
 
             # Forward pass through model
             outputs = model(inputs, imgs, labels)
@@ -128,7 +128,7 @@ def custom_train(train_loss, val_loss, best_model, epochs, learning_rate):
             detached_loss = loss.detach()
 
              # Get the predicted dopamine quality from the neural memory network
-            predicted_quality = model.mvp.img_model.get_predicted_dopamine_quality()
+            predicted_quality = model.image_processor.visual_embedding_module.get_predicted_dopamine_quality()
 
             # Calculate the losses for the neuromodulator and expectation-reward networks and optimize them depending on what phase it is
             if modulator_steps < cycle_length:
@@ -199,37 +199,13 @@ def custom_train(train_loss, val_loss, best_model, epochs, learning_rate):
         print('---------------------------------------------')
 
         # Save model and stats for checkpoints
-        save_model(best_model, 'latest_model')
+        save_model(best_model, f'latest_model_{epoch}')
         epochs += 1
         save_stats(train_loss, val_loss, epochs, scheduler.get_last_lr()[0])
 
     # Save the model and plot the loss
     plot_loss(losses, val_losses)
     return train_loss, val_loss
-
-
-def train():
-    training_config = TrainingArguments(
-        output_dir="agopalkr/EfficientDriveLM",
-        learning_rate=config.learning_rate,
-        per_device_train_batch_size=config.batch_size,
-        per_device_eval_batch_size=config.batch_size,
-        num_train_epochs=config.epochs,
-        weight_decay=config.weight_decay,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True,
-    )
-
-    trainer = Trainer(
-        model=model,
-        config=training_config,
-        train_dataset=train_dset,
-        eval_dataset=val_dset,
-    )
-
-    trainer.train()
-    model.push_to_hub("agopalkr/EfficientDriveLM")
 
 
 def save_experiment(statistics):
@@ -264,10 +240,8 @@ def params():
     parser = argparse.ArgumentParser()
     parser.add_argument("--learning-rate", default=1e-4, type=float,
                         help="Model learning rate starting point, default is 1e-4.")
-    parser.add_argument("--batch-size", default=4, type=int,
+    parser.add_argument("--batch-size", default=8, type=int,
                         help="Batch size per GPU/CPU for training and evaluation, defaults to 4.")
-    parser.add_argument("--weight-decay", default=0.05, type=float,
-                        help="L2 Regularization, default is 0.05")
     parser.add_argument("--epochs", default=15, type=int,
                         help="Number of epochs to train for, default is 15")
     parser.add_argument("--hf-train", action='store_true',
@@ -323,12 +297,12 @@ if __name__ == '__main__':
     # Get the token ID for the new CLS token
     cls_token_id = processor.convert_tokens_to_ids(cls_token)
     
-    model = DriveVLMT5(config, tokenizer=processor)  # Pass the tokenizer here
+    model = DriveT5VisionModel(config, tokenizer=processor)  # Pass the tokenizer here
     model.to(device)
     print('Trainable Parameters for full model')
     print_trainable_parameters(model)
 
-    train_dset = MultiFrameDataset(
+    train_dset = Dataset(
         input_file=os.path.join('data', 'multi_frame_sorted',
                                 'sorted_multi_frame_train.json'),
         tokenizer=processor,
@@ -336,7 +310,7 @@ if __name__ == '__main__':
             transforms.Normalize((127.5, 127.5, 127.5), (127.5, 127.5, 127.5))
         ])
     )
-    val_dset = MultiFrameDataset(
+    val_dset = Dataset(
         input_file=os.path.join('data', 'multi_frame_sorted',
                                 'sorted_multi_frame_val.json'),
         tokenizer=processor,
@@ -344,7 +318,7 @@ if __name__ == '__main__':
             transforms.Normalize((127.5, 127.5, 127.5), (127.5, 127.5, 127.5))
         ])
     )
-    test_dset = MultiFrameDataset(
+    test_dset = Dataset(
         input_file=os.path.join('data', 'multi_frame_sorted',
                                 'sorted_multi_frame_test.json'),
         tokenizer=processor,
@@ -361,49 +335,47 @@ if __name__ == '__main__':
     test_dataloader = DataLoader(test_dset, shuffle=False, batch_size=config.batch_size,
                                  num_workers=config.num_workers, collate_fn=train_dset.collate_fn, drop_last=True)
 
-    if not config.hf_train:
 
-        # Load checkpoint if neccesary:
-        if config.load_checkpoint:
+    # Load checkpoint if neccesary:
+    if config.load_checkpoint:
 
-            print('Loading model from ' + config.checkpoint_file)
+        print('Loading model from ' + config.checkpoint_file)
 
-            # Load the model and stats from the checkpoint
-            model.load_state_dict(torch.load(os.path.join('multi_frame_results', config.checkpoint_file,
-                                                          'latest_model.pth')))
-            best_model = DriveVLMT5(config, tokenizer=processor)  # Pass the tokenizer here
-            best_model.load_state_dict(torch.load(os.path.join('multi_frame_results', config.checkpoint_file,
-                                                               'latest_model.pth')))
+        # Load the model and stats from the checkpoint
+        model.load_state_dict(torch.load(os.path.join('multi_frame_results', config.checkpoint_file,
+                                                        'latest_model_11.pth')))
+        best_model = DriveT5VisionModel(config, tokenizer=processor)  # Pass the tokenizer here
+        best_model.load_state_dict(torch.load(os.path.join('multi_frame_results', config.checkpoint_file,
+                                                            'latest_model_11.pth')))
 
-            with open(os.path.join('multi_frame_results', config.checkpoint_file, 'stats.json'), 'r') as f:
-                stats = json.load(f)
+        with open(os.path.join('multi_frame_results', config.checkpoint_file, 'stats.json'), 'r') as f:
+            stats = json.load(f)
 
-            min_train_loss, min_val_loss, losses, val_losses, epochs_ran = stats['min train loss'], stats[
-                'min val loss'], stats['losses'], stats['val losses'], stats['epochs']
+        min_train_loss, min_val_loss, losses, val_losses, epochs_ran = stats['min train loss'], stats[
+            'min val loss'], stats['losses'], stats['val losses'], stats['epochs']
 
-            print(f'Minimum Training Loss: {min_train_loss}')
-            print(f'Training Losses: {losses}')
-            print(f'Minimum Validation Loss: {min_val_loss}')
-            print(f'Validation Losses: {val_losses}')
-            print(f'Epochs ran: {epochs_ran}')
-            timestr = config.checkpoint_file
-        else:
-            checkpoint_path = os.path.join('multi_frame_results', timestr)
-            print(f'All model checkpoints and training stats will be saved in {checkpoint_path}')
-            os.mkdir(os.path.join('multi_frame_results', timestr))
-
-        # If loading a checkpoint, use the learning rate from the last epoch
-        if config.load_checkpoint:
-            lr = stats['learning rate']
-        else:
-            lr = config.learning_rate
-
-        min_train_loss, min_val_loss = custom_train(min_train_loss, min_val_loss, best_model, epochs_ran, lr)
-        best_model = DriveVLMT5(config, tokenizer=processor)  # Pass the tokenizer here
-        best_model.load_state_dict(torch.load(os.path.join('multi_frame_results', timestr, 'latest_model.pth')))
-        best_model.to(device)
-        test_loss = val_model(test_dataloader, best_model)
-        statistics = [min_train_loss, min_val_loss, test_loss]
-        save_experiment(statistics)
+        print(f'Minimum Training Loss: {min_train_loss}')
+        print(f'Training Losses: {losses}')
+        print(f'Minimum Validation Loss: {min_val_loss}')
+        print(f'Validation Losses: {val_losses}')
+        print(f'Epochs ran: {epochs_ran}')
+        timestr = config.checkpoint_file
     else:
-        train()
+        checkpoint_path = os.path.join('multi_frame_results', timestr)
+        print(f'All model checkpoints and training stats will be saved in {checkpoint_path}')
+        os.mkdir(os.path.join('multi_frame_results', timestr))
+
+    # If loading a checkpoint, use the learning rate from the last epoch
+    if config.load_checkpoint:
+        lr = stats['learning rate']
+    else:
+        lr = config.learning_rate
+
+    min_train_loss, min_val_loss = train(min_train_loss, min_val_loss, best_model, epochs_ran, lr)
+    best_model = DriveT5VisionModel(config, tokenizer=processor)  # Pass the tokenizer here
+    best_model.load_state_dict(torch.load(os.path.join('multi_frame_results', timestr, 'latest_model_14.pth')))
+    best_model.to(device)
+    test_loss = val_model(test_dataloader, best_model)
+    statistics = [min_train_loss, min_val_loss, test_loss]
+    save_experiment(statistics)
+

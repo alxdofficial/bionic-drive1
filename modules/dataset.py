@@ -7,7 +7,7 @@ import torch
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-class MultiFrameDataset(Dataset):
+class Dataset(Dataset):
 
     def __init__(self, input_file, tokenizer, transform=None):
         with open(input_file) as f:

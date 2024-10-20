@@ -1,27 +1,15 @@
-import argparse
-import pdb
+
 
 import torch
-from pycocotools.coco import COCO
-from pycocoevalcap.eval import COCOEvalCap
+
 import os
-from modules.multi_frame_dataset import MultiFrameDataset
-from modules.multi_frame_model import DriveVLMT5
-from tqdm import tqdm as progress_bar
-from transformers import T5Tokenizer
-from torch.utils.data import DataLoader
-from torchvision import transforms
-import json
-import pandas as pd
+
 import matplotlib.pyplot as plt
 import re
 import matplotlib.patches as patches
 import numpy as np
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-
-
 
 
 # inference visualization helpers
