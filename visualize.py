@@ -76,7 +76,7 @@ def visualize_memory(model, frame_number, output_dir="visualizations", mode="heb
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     
-    model = model.mvp.img_model
+    model = model.image_processor.visual_embedding_module
     num_memory_networks = len(model.neural_memory_networks)
     num_subnetworks = model.neural_memory_networks[0].num_subnetworks
     num_layers = model.neural_memory_networks[0].num_layers

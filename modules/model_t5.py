@@ -43,18 +43,17 @@ class DriveT5VisionModel(nn.Module):
         print_trainable_parameters(self.language_model)
 
         # Initialize ImageProcessor for handling visual inputs
-        self.image_processor = self.ImageProcessor(hidden_size, config.lm, self.tokenizer, freeze=True)
+        self.image_processor = self.ImageProcessor(hidden_size, self.tokenizer, freeze=True)
 
     class ImageProcessor(nn.Module):
         """
         Processes image and text embeddings together and manages multi-modal operations.
         """
-        def __init__(self, hidden_size, lm_type, tokenizer, freeze=False):
+        def __init__(self, hidden_size, tokenizer, freeze=False):
             super().__init__()
 
             self.tokenizer = tokenizer
             self.visual_embedding_module = Brain()  # Use Brain model for processing visual data
-            self.lm_type = lm_type
 
             # Embedding to distinguish between modalities (text/image)
             self.modality_embeddings = nn.Embedding(2, hidden_size)
@@ -68,10 +67,6 @@ class DriveT5VisionModel(nn.Module):
             # Pass images and CLS tokens through the Brain model
             visual_features = self.visual_embedding_module(imgs, cls_tokens)
 
-            # Apply linear transformation if using a large LM model
-            if self.lm_type != 'T5-Base':
-                visual_features = self.project_to_language_model(visual_features)
-
             # Add modality embeddings for image embeddings
             visual_features += self.modality_embeddings(
                 torch.ones(visual_features.shape[:2], dtype=torch.int, device=visual_features.device)
@@ -82,10 +77,10 @@ class DriveT5VisionModel(nn.Module):
         def forward(self, text_input, imgs, text_model):
             # Extract text embeddings
             text_embeddings = text_model.get_input_embeddings()(text_input)
-
+            num_cls = 3
             # Create and append CLS tokens
             cls_token_id = self.tokenizer.convert_tokens_to_ids('<cls>')
-            cls_embeddings = text_model.get_input_embeddings()(torch.tensor([cls_token_id] * 3, device=text_input.device))
+            cls_embeddings = text_model.get_input_embeddings()(torch.tensor([cls_token_id] * num_cls, device=text_input.device))
             cls_embeddings = cls_embeddings.unsqueeze(0).expand(text_embeddings.size(0), -1, -1)
 
             text_embeddings = torch.cat([text_embeddings, cls_embeddings], dim=1)
@@ -95,8 +90,8 @@ class DriveT5VisionModel(nn.Module):
             outputs = text_model.encoder(inputs_embeds=text_embeddings, attention_mask=attention_mask)
             
             # Extract CLS tokens and text embeddings
-            cls_tokens = outputs.last_hidden_state[:, -3:, :]
-            text_embeddings = outputs.last_hidden_state[:, :-3, :]
+            cls_tokens = outputs.last_hidden_state[:, -num_cls:, :]
+            text_embeddings = outputs.last_hidden_state[:, :-num_cls, :]
 
             # Extract visual features and combine with CLS tokens
             visual_features = self.extract_visual_features(imgs, cls_tokens)

@@ -1,4 +1,6 @@
 from transformers import T5Tokenizer, TrainingArguments, Trainer
+from transformers import LlamaTokenizer, LlamaForCausalLM
+
 from torchvision import transforms
 import json
 import os
@@ -7,7 +9,7 @@ from torch.utils.data import DataLoader
 import torch
 import argparse
 from modules.dataset import Dataset
-from modules.model import print_trainable_parameters, DriveT5VisionModel
+from modules.model_t5 import print_trainable_parameters, DriveT5VisionModel
 import matplotlib.pyplot as plt
 import pandas as pd
 from copy import deepcopy
@@ -29,6 +31,8 @@ def val_model(dloader, val_model):
     val_loss = 0
 
     for idx, (inputs, imgs, labels) in tqdm(enumerate(dloader), total=len(dloader)):
+        with torch.no_grad():
+            val_model.image_processor.visual_embedding_module.update_neural_modulators()
         outputs = val_model(inputs, imgs, labels)
         val_loss += outputs.loss.item()
 
@@ -44,7 +48,6 @@ def save_stats(train_loss, val_loss, epochs, lr):
         'epochs': epochs,
         'learning rate': lr,
         'LM': 'T5-Base',
-        'Image Embedding': 'Patch'
     }
 
     # Save stats into checkpoint
@@ -69,10 +72,11 @@ def expectation_reward_criteria(batch_loss, predicted_quality):
     return torch.abs(-batch_loss - predicted_quality)
 
 def neuromodulator_criteria(predicted_quality):
-    """Criteria for the neuromodulator, aiming to minimize the predicted dopamine quality."""
+    """Criteria for the neuromodulator, aiming to maximize the predicted dopamine quality."""
     return -predicted_quality
 
 def train(train_loss, val_loss, best_model, epochs, learning_rate):
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9, last_epoch=-1, verbose=False)
 
@@ -91,15 +95,15 @@ def train(train_loss, val_loss, best_model, epochs, learning_rate):
         model.train()
         epoch_loss = 0
 
-        i = 0
         modulator_steps, expectation_steps = 0, 0
         cycle_length = 10
 
         for step, (inputs, imgs, labels) in tqdm(enumerate(train_dataloader), total=len(train_dataloader)):
-            i += 1
-            # if i % 100 == 0 or i == 1:
-            #     visualize_memory(model, frame_number=i)
-            if i % 100 == 0:
+        # for step, (inputs, imgs, labels) in enumerate(train_dataloader):
+            # if step % 100 == 0:
+                # print(step)
+                # visualize_memory(model, frame_number=i)
+            if step % 50 == 0:
                 gc.collect()  # Collect garbage to free CPU memory
                 torch.cuda.empty_cache()  # Free up GPU memory
             # print(inputs.shape, imgs.shape, labels.shape)
@@ -107,42 +111,41 @@ def train(train_loss, val_loss, best_model, epochs, learning_rate):
             with torch.no_grad():
                 model.image_processor.visual_embedding_module.update_neural_modulators()
 
+            optimizer.zero_grad()
             # Forward pass through model
             outputs = model(inputs, imgs, labels)
-
             # Calculate loss
             loss = outputs.loss
             epoch_loss += loss.item()
-
             # Back-propogate
             loss.backward()
-            # zero out gradeints of hebbian params that shouldnt be updated using backprop
-            for name, param in model.named_parameters():
-                if 'hebbian_weights' in name or 'hebbian_recurrent_weights' in name or 'neuromodulator' in name or 'expectation_reward_network' in name:
-                    param.grad = None  # Freeze neuromodulator and expectation-reward networks during brain backprop
-
             optimizer.step()
-            optimizer.zero_grad()
 
-            # Detach the loss before calculating modulator loss and reward loss
-            detached_loss = loss.detach()
+            # for name, param in model.named_parameters():
+            #     # Check if the parameter belongs to VisionEncoder and has gradients
+            #     if 'vision_encoder' in name and param.grad is not None:
+            #         grad_mean = param.grad.mean().item()  # Min of current param's gradient
+            #         print(grad_mean)
 
-             # Get the predicted dopamine quality from the neural memory network
+            # train neuromodulator in RL inspired way
+            modulator_optimizer.zero_grad()
+            expectation_reward_optimizer.zero_grad()
+            # calculate neuromodulators again but with gradients
+            model.image_processor.visual_embedding_module.update_neural_modulators()
+            # Get the predicted dopamine quality from the neural memory network
             predicted_quality = model.image_processor.visual_embedding_module.get_predicted_dopamine_quality()
 
             # Calculate the losses for the neuromodulator and expectation-reward networks and optimize them depending on what phase it is
             if modulator_steps < cycle_length:
                 modulator_loss = neuromodulator_criteria(predicted_quality).mean()
                 # Optimize the neuromodulator network
-                modulator_optimizer.zero_grad()
                 modulator_loss.backward()
                 modulator_optimizer.step()
                 modulator_steps += 1
 
             elif expectation_steps < cycle_length:
-                reward_loss = expectation_reward_criteria(detached_loss, predicted_quality).mean()
+                reward_loss = expectation_reward_criteria(loss.detach(), predicted_quality).mean()
                 # Optimize the expectation-reward network
-                expectation_reward_optimizer.zero_grad()
                 reward_loss.backward()
                 expectation_reward_optimizer.step()
                 expectation_steps += 1
@@ -151,32 +154,31 @@ def train(train_loss, val_loss, best_model, epochs, learning_rate):
             if modulator_steps == cycle_length and expectation_steps == cycle_length:
                 modulator_steps, expectation_steps = 0, 0
 
+            # if step % config.checkpoint_frequency == 0:
+            #     print(step)
+            #     print('Loss: ' + str(loss.item()))
 
-            if step % config.checkpoint_frequency == 0:
-                print()
-                print('Loss: ' + str(loss.item()))
+            #     # Get the hidden states (output)
+            #     hidden_states = outputs.logits
 
-                # Get the hidden states (output)
-                hidden_states = outputs.logits
+            #     # Perform decoding (e.g., greedy decoding)
+            #     outputs = torch.argmax(hidden_states, dim=-1)
 
-                # Perform decoding (e.g., greedy decoding)
-                outputs = torch.argmax(hidden_states, dim=-1)
-
-                try:
-                    text_outputs = [processor.decode(output.to('cpu'), skip_special_tokens=True) for output in outputs]
-                    text_questions = [processor.decode(q.to('cpu'), skip_special_tokens=True) for q in inputs]
-                    text_labels = [processor.decode(a.to('cpu'), skip_special_tokens=True) for a in labels]
-                    print()
-                    print('Questions:')
-                    print(text_questions)
-                    print()
-                    print('Generated Answers:')
-                    print(text_outputs)
-                    print()
-                    print('Ground Truth Answers:')
-                    print(text_labels)
-                except:
-                    print("printout qa example errored out")    
+            #     try:
+            #         text_outputs = [processor.decode(output.to('cpu'), skip_special_tokens=True) for output in outputs]
+            #         text_questions = [processor.decode(q.to('cpu'), skip_special_tokens=True) for q in inputs]
+            #         text_labels = [processor.decode(a.to('cpu'), skip_special_tokens=True) for a in labels]
+            #         print()
+            #         print('Questions:')
+            #         print(text_questions)
+            #         print()
+            #         print('Generated Answers:')
+            #         print(text_outputs)
+            #         print()
+            #         print('Ground Truth Answers:')
+            #         print(text_labels)
+            #     except:
+            #         print("printout qa example errored out")    
 
         # Get train and val loss per batch
         epoch_train_loss = epoch_loss / len(train_dataloader)
@@ -184,12 +186,6 @@ def train(train_loss, val_loss, best_model, epochs, learning_rate):
 
         epoch_val_loss = val_model(val_dataloader, model)
         val_losses.append(epoch_val_loss)
-
-        if not val_loss or min(epoch_val_loss, val_loss) == epoch_val_loss:
-            val_loss = epoch_val_loss
-            best_model = deepcopy(model.state_dict())
-        if not train_loss or min(train_loss, epoch_train_loss) == epoch_train_loss:
-            train_loss = epoch_train_loss
 
         # Adjust learning rate scheduler
         scheduler.step()
@@ -199,41 +195,12 @@ def train(train_loss, val_loss, best_model, epochs, learning_rate):
         print('---------------------------------------------')
 
         # Save model and stats for checkpoints
-        save_model(best_model, f'latest_model_{epoch}')
+        save_model(model, f'latest_model_{epoch}')
         epochs += 1
         save_stats(train_loss, val_loss, epochs, scheduler.get_last_lr()[0])
-
-    # Save the model and plot the loss
-    plot_loss(losses, val_losses)
+        # plot the loss
+        plot_loss(losses, val_losses)
     return train_loss, val_loss
-
-
-def save_experiment(statistics):
-    """
-    Saves the experiment multi_frame_results to a csv
-    :param config: The hyperparameters used
-    :param statistics: The accuracies for the training, validation, and test sets
-    """
-    trial_dict = {
-        'Model name': [timestr],
-        'Learning rate': [config.learning_rate],
-        'Weight decay': [config.weight_decay],
-        'Batch size': [config.batch_size],
-        'Epochs': [config.epochs],
-        'LoRA finetuning': [config.lora],
-        'GPA Hidden Size': [config.gpa_hidden_size],
-        'LoRA Dimension': [config.lora_dim],
-        'LoRA Alpha': [config.lora_alpha],
-        'LoRA Dropout': [config.lora_dropout],
-        'Freeze T5': [config.freeze_lm],
-        'Min Training Loss': [statistics[0]],
-        'Min Validation Loss': [statistics[1]],
-        'Min Testing Loss': [statistics[2]],
-    }
-
-    trial_dict = pd.DataFrame(trial_dict)
-    trial_dict.to_csv(os.path.join('multi_frame_results', timestr, 'multi_frame_results.csv'), index=False, header=True)
-
 
 def params():
 
@@ -241,27 +208,15 @@ def params():
     parser.add_argument("--learning-rate", default=1e-4, type=float,
                         help="Model learning rate starting point, default is 1e-4.")
     parser.add_argument("--batch-size", default=8, type=int,
-                        help="Batch size per GPU/CPU for training and evaluation, defaults to 4.")
-    parser.add_argument("--epochs", default=15, type=int,
+                        help="Batch size per GPU/CPU for training and evaluation, defaults to 8.")
+    parser.add_argument("--epochs", default=12, type=int,
                         help="Number of epochs to train for, default is 15")
-    parser.add_argument("--hf-train", action='store_true',
-                        help="Whether to use HuggingFace default training or custom training loop")
-    parser.add_argument('--gpa-hidden-size', default=128, type=int, help='Hidden dimension for Gated Pooling Attention, '
-                                                                         'default is 128')
-    parser.add_argument('--freeze-lm', action='store_true', help='Freeze LM during training')
-    parser.add_argument('--lm', default='T5-Base', choices=['T5-Base', 'T5-Large'], type=str, help='Backbone LM to use, '
-                                                                                        'use \'T5-Base\' for T5-Medium')
     parser.add_argument('--checkpoint-frequency', default=500, type=int, help='Frequency of showing example outputs')
-    parser.add_argument('--lora', action='store_true', help='Perform LoRA finetuning, recommend if '
-                                                            'using T5-Large backbone LM')
-    parser.add_argument('--lora-dim', default=64, type=int, help='LoRA dimension')
-    parser.add_argument('--lora-alpha', default=32, type=int, help='LoRA alpha')
-    parser.add_argument('--lora-dropout', default=0.05, type=float, help='LoRA dropout')
-    parser.add_argument('--num-workers', default=0, type=int, help='# of Workers used by Dataloader')
     parser.add_argument('--load-checkpoint', action='store_true', help='Whether to load a checkpoint from '
                                                                        'multi_frame_results folder')
     parser.add_argument('--checkpoint-file', default='T5-Medium', type=str, help='The checkpoint to load from '
                                                                                  'multi_frame_results directory')
+    parser.add_argument('--num-workers', default=0, type=int, help='# of Workers used by Dataloader')
 
     args = parser.parse_args()
     return args
@@ -284,10 +239,8 @@ if __name__ == '__main__':
 
     # Load processors and models
 
-    if config.lm == 'T5-Base':
-        processor = T5Tokenizer.from_pretrained('google-t5/t5-base')
-    else:
-        processor = T5Tokenizer.from_pretrained('google-t5/t5-large')
+    processor = T5Tokenizer.from_pretrained('google-t5/t5-base')
+
 
     processor.add_tokens('<')
     # Add the cls token to the tokenizer
@@ -318,22 +271,16 @@ if __name__ == '__main__':
             transforms.Normalize((127.5, 127.5, 127.5), (127.5, 127.5, 127.5))
         ])
     )
-    test_dset = Dataset(
-        input_file=os.path.join('data', 'multi_frame_sorted',
-                                'sorted_multi_frame_test.json'),
-        tokenizer=processor,
-        transform=transforms.Compose([
-            transforms.Normalize((127.5, 127.5, 127.5), (127.5, 127.5, 127.5))
-        ])
-    )
 
     # Create Dataloaders
-    train_dataloader = DataLoader(train_dset, shuffle=False, batch_size=config.batch_size,
+    # train_dataloader = DataLoader(train_dset, shuffle=False, batch_size=config.batch_size,
+    #                               num_workers=config.num_workers, collate_fn=train_dset.collate_fn, drop_last=True)
+    # val_dataloader = DataLoader(val_dset, shuffle=False, batch_size=config.batch_size,
+    #                             num_workers=config.num_workers, collate_fn=train_dset.collate_fn, drop_last=True)
+    train_dataloader = DataLoader(train_dset, shuffle=True, batch_size=config.batch_size,
                                   num_workers=config.num_workers, collate_fn=train_dset.collate_fn, drop_last=True)
-    val_dataloader = DataLoader(val_dset, shuffle=False, batch_size=config.batch_size,
+    val_dataloader = DataLoader(val_dset, shuffle=True, batch_size=config.batch_size,
                                 num_workers=config.num_workers, collate_fn=train_dset.collate_fn, drop_last=True)
-    test_dataloader = DataLoader(test_dset, shuffle=False, batch_size=config.batch_size,
-                                 num_workers=config.num_workers, collate_fn=train_dset.collate_fn, drop_last=True)
 
 
     # Load checkpoint if neccesary:
@@ -342,13 +289,9 @@ if __name__ == '__main__':
         print('Loading model from ' + config.checkpoint_file)
 
         # Load the model and stats from the checkpoint
-        model.load_state_dict(torch.load(os.path.join('multi_frame_results', config.checkpoint_file,
-                                                        'latest_model_11.pth')))
-        best_model = DriveT5VisionModel(config, tokenizer=processor)  # Pass the tokenizer here
-        best_model.load_state_dict(torch.load(os.path.join('multi_frame_results', config.checkpoint_file,
-                                                            'latest_model_11.pth')))
+        model = torch.load(config.checkpoint_file) 
 
-        with open(os.path.join('multi_frame_results', config.checkpoint_file, 'stats.json'), 'r') as f:
+        with open("multi_frame_results/20241023-214628/stats.json", 'r') as f:
             stats = json.load(f)
 
         min_train_loss, min_val_loss, losses, val_losses, epochs_ran = stats['min train loss'], stats[
@@ -361,9 +304,9 @@ if __name__ == '__main__':
         print(f'Epochs ran: {epochs_ran}')
         timestr = config.checkpoint_file
     else:
-        checkpoint_path = os.path.join('multi_frame_results', timestr)
+        checkpoint_path = os.path.join('train_results', timestr)
         print(f'All model checkpoints and training stats will be saved in {checkpoint_path}')
-        os.mkdir(os.path.join('multi_frame_results', timestr))
+        os.mkdir(os.path.join('train_results', timestr))
 
     # If loading a checkpoint, use the learning rate from the last epoch
     if config.load_checkpoint:
@@ -372,10 +315,5 @@ if __name__ == '__main__':
         lr = config.learning_rate
 
     min_train_loss, min_val_loss = train(min_train_loss, min_val_loss, best_model, epochs_ran, lr)
-    best_model = DriveT5VisionModel(config, tokenizer=processor)  # Pass the tokenizer here
-    best_model.load_state_dict(torch.load(os.path.join('multi_frame_results', timestr, 'latest_model_14.pth')))
-    best_model.to(device)
-    test_loss = val_model(test_dataloader, best_model)
-    statistics = [min_train_loss, min_val_loss, test_loss]
-    save_experiment(statistics)
+
 
