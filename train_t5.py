@@ -1,6 +1,6 @@
 from transformers import T5Tokenizer, TrainingArguments, Trainer
 from transformers import LlamaTokenizer, LlamaForCausalLM
-
+import multiprocessing
 from torchvision import transforms
 import json
 import os
@@ -19,11 +19,7 @@ from tqdm import tqdm
 import gc
 from visualize import visualize_memory
 import random
-random.seed(2002)
-torch.cuda.manual_seed(2002)
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(device)
 
 def save_model(model, model_name):
     # Save the model into the designated folder
@@ -94,7 +90,7 @@ def train(train_loss, val_loss, best_model, epochs, learning_rate):
             # if step % 100 == 0:
                 # print(step)
                 # visualize_memory(model, frame_number=i)
-            if step % 50 == 0:
+            if step % 20 == 0:
                 gc.collect()  # Collect garbage to free CPU memory
                 torch.cuda.empty_cache()  # Free up GPU memory
 
@@ -178,7 +174,7 @@ def params():
                                                                        'multi_frame_results folder')
     parser.add_argument('--checkpoint-file', default='T5-Medium', type=str, help='The checkpoint to load from '
                                                                                  'multi_frame_results directory')
-    parser.add_argument('--num-workers', default=0, type=int, help='# of Workers used by Dataloader')
+    parser.add_argument('--num-workers', default=2, type=int, help='# of Workers used by Dataloader')
 
     args = parser.parse_args()
     return args
@@ -187,6 +183,12 @@ def params():
 if __name__ == '__main__':
 
     # torch.autograd.set_detect_anomaly(True)
+    random.seed(2002)
+    torch.cuda.manual_seed(2002)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(device)
+    multiprocessing.set_start_method('spawn')
 
     timestr = time.strftime("%Y%m%d-%H%M%S")
 
