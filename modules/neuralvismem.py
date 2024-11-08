@@ -2,162 +2,230 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import random
-import torch.jit
 
-# Define the input and output dimensions for internal modules
-INTERNAL_DIM = 768
-NUM_SUB_NETWORKS = 2
-NUM_LAYERS = 4
-NUM_MEMORY_NETWORKS = 8
 IMG_WIDTH = 1600
 IMG_HEIGHT = 900
 LONG_SHORT_TERM_PROB = 0.5
+INTERNAL_DIM = 768
+NUM_SUBNETWORKS = 1
+NUM_UNITS = 64
+TOTAL_DIM = INTERNAL_DIM * NUM_SUBNETWORKS  # Calculate the total dimension
+NUM_LAYERS = 6
+NUM_MEMORY_NETWORKS = 4
+POSITIONAL_ENCODING_SCALE = 0.01
+ALPHA_BIAS = 0.1
+ALPHA_SCALE = 9.9
+DECAY_BIAS = 0.01
+DECAY_SCALE = 1.99
 
-# 1. Feature Extractor
+
+
+# Feature Extractor
 class FeatureExtractor(nn.Module):
-    def __init__(self, input_channels=3, num_layers=5, kernel_size=5, stride=3, dropout=0.3):
+    def __init__(self, input_channels=3, kernel_size=5, stride=3, dropout=0.2):
         super(FeatureExtractor, self).__init__()
-        channels = [16, 64, 128, 256, 512]  # Specified number of channels for each layer
+        hidden = [16, 64, 256, INTERNAL_DIM]  # Specified number of channels for each layer
         layers = []
-        for i in range(num_layers):
-            layers.append(nn.Conv2d(input_channels, channels[i], kernel_size=kernel_size, stride=stride))
-            if i != num_layers - 1:
-                layers.append(nn.BatchNorm2d(channels[i]))
+        for i in range(len(hidden)):
+            layers.append(nn.Conv2d(input_channels, hidden[i], kernel_size=kernel_size, stride=stride, padding=2))
+            if i != len(hidden) - 1:
+                layers.append(nn.BatchNorm2d(hidden[i]))
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(dropout))
-            input_channels = channels[i]
+            input_channels = hidden[i]
         self.extractor = nn.Sequential(*layers)
 
     def forward(self, x):   
         return self.extractor(x)
-# 2. Fully Connected Layer
-class FullyConnected(nn.Module):
-    def __init__(self, input_dim, hidden_dims, output_dim, dropout=0.3):
-        super(FullyConnected, self).__init__()
-        layers = []
-        current_dim = input_dim
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(current_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(dropout))
-            layers.append(nn.LayerNorm(hidden_dim))
-            current_dim = hidden_dim
-        layers.append(nn.Linear(current_dim, output_dim))
-        self.fc = nn.Sequential(*layers)
+    
+# Fovea Position Predictor
+class FoveaPosPredictor(nn.Module):
+    def __init__(self, input_dim=INTERNAL_DIM * 2, dropout=0.2):
+        super(FoveaPosPredictor, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 256)
+        self.fc2 = nn.Linear(256, 128)
+        self.fc3 = nn.Linear(128, 8*23)
+
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm1 = nn.LayerNorm(256)
+        self.layer_norm2 = nn.LayerNorm(128)
+        self.sigmoid = nn.Sigmoid()  # For generating the importance map
+
+    def forward(self, memory_encoding, cls_token):
+        # Concatenate memory encoding and CLS token along the last dimension
+        combined_input = torch.cat((memory_encoding, cls_token), dim=-1)
+        # Pass through fully connected layers
+        x = F.relu(self.layer_norm1(self.fc1(combined_input)))
+        x = self.dropout(x)
+        x = F.relu(self.layer_norm2(self.fc2(x)))
+        x = self.dropout(x)
+        importance_map = self.sigmoid(self.fc3(x))  # Importance map with shape matching flattened_features
+
+        return importance_map
+    
+# Vision Encoder
+class VisionEncoder(nn.Module): 
+    def __init__(self, device='cuda'):
+        super(VisionEncoder, self).__init__()
+        self.device = device
+        # Feature extractor with CNN layers to downsample to a feature map
+        self.feature_extractor = FeatureExtractor()
+        self.fovea_pos_predictor = FoveaPosPredictor()
+
+    def concatenate_images(self, imgs):
+        # Resize each image to 300x600
+        resized_imgs = [F.interpolate(img, size=(300, 600), mode='bilinear', align_corners=False) for img in imgs]
+        
+        # Arrange images into 2x3 grid
+        top_row = torch.cat([resized_imgs[1], resized_imgs[0], resized_imgs[2]], dim=-1)  # front_left, front, front_right
+        bottom_row = torch.cat([resized_imgs[4], resized_imgs[3], resized_imgs[5]], dim=-1)  # back_left, back, back_right
+        
+        # Concatenate the top and bottom rows to form a 2x3 grid
+        full_concat_img = torch.cat([top_row, bottom_row], dim=-2)  # Shape: (batch_size, 3, 600, 1800)
+        
+        return full_concat_img
+    
+    def grid_positional_encoding(self, grid_x, grid_y, device='cuda'):
+        """
+        Generate a grid-based positional encoding by normalizing grid_x and grid_y and replicating
+        them to match INTERNAL_DIM.
+
+        :param grid_x: x-coordinate of the grid cell.
+        :param grid_y: y-coordinate of the grid cell.
+        :return: Positional encoding tensor of shape (INTERNAL_DIM,)
+        """
+        # Normalize grid coordinates between 0 and 1
+        norm_x = grid_x / (self.grid_width - 1)
+        norm_y = grid_y / (self.grid_height - 1)
+
+        # Create a tensor for positional encoding by replicating norm_x and norm_y
+        pos_encoding = torch.tensor([norm_x, norm_y], device=device, dtype=torch.float32)
+
+        # Replicate to match INTERNAL_DIM
+        repeats = INTERNAL_DIM // pos_encoding.shape[0]
+        remainder = INTERNAL_DIM % pos_encoding.shape[0]
+        pos_encoding = torch.cat([pos_encoding.repeat(repeats), pos_encoding[:remainder]])
+
+        return pos_encoding  * POSITIONAL_ENCODING_SCALE # Shape: (INTERNAL_DIM,)
+
+    def forward_peripheral(self, imgs):
+        # Concatenate images in a 2x3 grid format
+        concat_image = self.concatenate_images(imgs)  # Shape: (batch_size, 3, IMG_HEIGHT*2, IMG_WIDTH*3)
+        # Pass the concatenated image through the CNN to get the initial feature map
+        feature_map = self.feature_extractor(concat_image)  # Shape: (batch_size, channels, grid_height, grid_width)
+        self.feature_map = feature_map
+        # Store the original spatial dimensions before pooling
+        original_height, original_width = feature_map.size(2), feature_map.size(3)
+        self.grid_height = original_height
+        self.grid_width = original_width
+        # print(self.feature_map.shape)
+        # Apply max pooling to reduce spatial dimensions
+        pooled_feature_map = F.adaptive_max_pool2d(feature_map, output_size=(original_height // 4, original_width // 6))
+        # pooled_feature_map shape: (batch_size, channels, pooled_height, pooled_width)
+        # Calculate the positional encoding for each pooled vector and add it
+        batch_size, channels, pooled_height, pooled_width = pooled_feature_map.size()
+        pos_encoded_pooled_features = []
+
+        for row in range(pooled_height):
+            for col in range(pooled_width):
+                # Calculate the center of the corresponding region in the original feature map
+                avg_row = (row + 0.5) * original_height / pooled_height
+                avg_col = (col + 0.5) * original_width / pooled_width
+
+                # Generate the positional encoding for the (avg_row, avg_col) position
+                pos_encoding = self.grid_positional_encoding(avg_row, avg_col).to(self.device)
+                # Expand to batch size and add to each vector in the batch
+                pos_encoding_batch = pos_encoding.unsqueeze(0).expand(batch_size, -1)
+
+                # Extract the pooled vector at (row, col) and add positional encoding
+                pooled_vector = pooled_feature_map[:, :, row, col]  # Shape: (batch_size, channels)
+                pooled_vector = F.normalize(pooled_vector)
+                # print(pooled_vector.mean(), pos_encoding_batch.mean())
+                pooled_vector_with_pos = pooled_vector + pos_encoding_batch  # Add positional encoding
+                # Store in the list
+                pos_encoded_pooled_features.append(pooled_vector_with_pos)
+        # print(len(pos_encoded_pooled_features), pos_encoded_pooled_features[0].shape)
+        return pos_encoded_pooled_features  # Shape: (batch_size, pooled_height * pooled_width, channels)
+
+    def forward_fovea(self, memory_encoding, cls_token, temperature=0.1):
+        # Get importance map from FoveaPosPredictor
+        importance_map = self.fovea_pos_predictor(memory_encoding, cls_token)  # Shape: (batch_size, flattened_features_dim)
+        # Reshape to match the 2D grid dimensions
+        importance_grid = importance_map.view(-1, self.grid_height, self.grid_width)  # Shape: (batch_size, grid_height, grid_width)
+
+        # Apply softmax with temperature scaling to get a peaked importance distribution
+        scaled_importance_map = F.softmax(importance_grid.view(-1, self.grid_height * self.grid_width) / temperature, dim=-1)
+        scaled_importance_map = scaled_importance_map.view(-1, self.grid_height, self.grid_width)
+
+        # Expand dimensions to match feature map for element-wise multiplication
+        scaled_importance_map_expanded = scaled_importance_map.unsqueeze(1)  # Shape: (batch_size, 1, grid_height, grid_width)
+
+        # Apply weighted sum on feature map using the scaled importance map
+        weighted_features = (self.feature_map * scaled_importance_map_expanded).sum(dim=(2, 3))  # Sum over spatial dimensions
+        weighted_features = F.normalize(weighted_features)
+        # Find the max value's position for positional encoding
+        max_positions = scaled_importance_map.view(-1, self.grid_height * self.grid_width).argmax(dim=-1)
+        max_rows = max_positions // self.grid_width
+        max_cols = max_positions % self.grid_width
+
+        # Generate positional encoding for each max position in the batch
+        batch_size = weighted_features.size(0)
+        pos_encodings = []
+        for i in range(batch_size):
+            pos_encoding = self.grid_positional_encoding(max_rows[i].item(), max_cols[i].item())
+            pos_encodings.append(pos_encoding)
+
+        # Concatenate positional encodings to match batch size and add to weighted features
+        pos_encodings = torch.stack(pos_encodings).to(self.device)  # Shape: (batch_size, INTERNAL_DIM)
+        weighted_features_with_pos = weighted_features + pos_encodings  # Add positional encoding to weighted features
+        return weighted_features_with_pos  # Shape of weighted_features_with_pos: (batch_size, channels)
+
+
+# Neuromodulator Class
+class Neuromodulator(nn.Module):
+    def __init__(self, total_dim, num_units):
+        super(Neuromodulator, self).__init__()
+        self.num_units = num_units
+        
+        # Fully connected layers with ReLU and normalization
+        self.fc1 = nn.Linear(total_dim, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, num_units)
+        
+        self.layer_norm1 = nn.LayerNorm(512)
+        self.layer_norm2 = nn.LayerNorm(256)
+        self.output_norm = nn.LayerNorm(num_units)
+        self.tanh = nn.Tanh()  # Output dopamine signals in range [-1, 1]
 
     def forward(self, x):
-        return self.fc(x)
+        x = F.relu(self.layer_norm1(self.fc1(x)))
+        x = F.relu(self.layer_norm2(self.fc2(x)))
+        dopamine_signals = self.tanh(self.output_norm(self.fc3(x)))  # Shape: (batch_size, num_units)
+        return dopamine_signals.mean(dim=0)  # Average across batch, final shape: (num_units,)
 
-# takes in an embedding of peripheral vision and one cls token, predicts x and y coordinate of fovea as percent
-# and predicts which image out of 6 to focus on
-class FoveaPosPredictor(nn.Module):
-    def __init__(self, dropout=0.3):
-        super(FoveaPosPredictor, self).__init__()
-        hidden_dims = [256, 128, 32]
-        self.fc = FullyConnected(INTERNAL_DIM + INTERNAL_DIM, hidden_dims, 8)  # 2 for x,y and 6 for image selection
-        self.sigmoid = nn.Sigmoid()  # For x and y coordinates
-        self.softmax = nn.Softmax(dim=-1)  # For image selection (6 cameras)
-
-    def forward(self, peripheral_embedding, cls_token):
-        # Concatenate peripheral image encoding and CLS token along the last dimension
-        combined_input = torch.cat((peripheral_embedding, cls_token), dim=-1)
-        output = self.fc(combined_input)
-        
-        # Separate the output into fovea coordinates and image selection
-        fovea_coords = self.sigmoid(output[:, :2])  # 2D coordinates normalized between 0 and 1
-        image_selection = self.softmax(output[:, 2:])  # Softmax over 6 cameras
-
-        return fovea_coords, image_selection
-
-
-# 3. Vision Encoder
-class VisionEncoder(nn.Module):
-    def __init__(self):
-        super(VisionEncoder, self).__init__()
-        self.img_width = IMG_WIDTH
-        self.img_height = IMG_HEIGHT
-
-        # Feature extractors
-        self.fovea_feature_extractor = FeatureExtractor()
-        self.peripheral_feature_extractor = FeatureExtractor()
-        
-        # Fully connected layers
-        flattened_dim = 512  # Output from feature extractor after flattening
-        hidden_dims = [256]
-        output_dim = INTERNAL_DIM
-        
-        self.fovea_fc = FullyConnected(flattened_dim, hidden_dims, output_dim)
-        self.peripheral_fc = FullyConnected(flattened_dim, hidden_dims, output_dim)
-
-    def forward_fovea(self, images, fovea_coords):
-        # images: (batch_size, 3, img_height, img_width)
-        # fovea_coords: (batch_size, 2) - (x, y) in percentage
-
-        batch_size = images.size(0)
-        x_coords = (fovea_coords[:, 0] * self.img_width).int()
-        y_coords = (fovea_coords[:, 1] * self.img_height).int()
-
-        # Crop the fovea image (centered around the scaled coordinates in the original image)
-        crop_size = 512
-        half_crop = crop_size // 2
-
-        fovea_images = []
-        for i in range(batch_size):
-            x, y = x_coords[i], y_coords[i]
-            x = min(max(x, half_crop), self.img_width - half_crop)
-            y = min(max(y, half_crop), self.img_height - half_crop)
-            fovea_image = images[i:i+1, :, y-half_crop:y+half_crop, x-half_crop:x+half_crop]
-            # fovea_image: (1, 3, 512, 512)
-            fovea_images.append(fovea_image)
-
-        fovea_images = torch.cat(fovea_images, dim=0)
-        # fovea_images: (batch_size, 3, 512, 512)
-
-        # Fovea feature extraction
-        fovea_features = self.fovea_feature_extractor(fovea_images)
-        # fovea_features: (batch_size, channels, h, w) after feature extraction 
-        fovea_features = fovea_features.view(fovea_features.size(0), -1)  # Flatten
-        # fovea_features: (batch_size, flattened_dim)
-        fovea_output = self.fovea_fc(fovea_features)
-        # fovea_output: (batch_size, output_dim)
-
-        return fovea_output
-
-    def forward_peripheral(self, image):
-        # image: (batch_size, 3, original_height, original_width)
-        # print(f"in vision encoder forward_peripheral, image shape: ", image.shape)
-        # Resize the entire image
-        peripheral_image = F.interpolate(image, size=(512, 512), mode='bilinear', align_corners=False)
-        # peripheral_image: (batch_size, 3, 512, 512)
-
-        # Peripheral feature extraction
-        peripheral_features = self.peripheral_feature_extractor(peripheral_image)
-        # peripheral_features: (batch_size, channels, h, w) after feature extraction, h,w is 1
-        peripheral_features = peripheral_features.view(peripheral_features.size(0), -1)  # Flatten
-        # peripheral_features: (batch_size, flattened_dim)
-        peripheral_output = self.peripheral_fc(peripheral_features)
-        # peripheral_output: (batch_size, output_dim)
-
-        return peripheral_output
-
-# 4. Hebbian Layer
+# Updated Hebbian Layer Class
 class HebbianLayer(nn.Module):
-    def __init__(self, dim, alpha_init=0.1, decay_init=0.01, device='cuda'):
+    def __init__(self, total_dim, num_units, device='cuda'):
         super(HebbianLayer, self).__init__()
-        self.dim = dim
+        
+        self.total_dim = total_dim
+        self.num_units = num_units
         self.device = device
 
-        # Hebbian weights and recurrent weights (regular tensors)
-        self.hebbian_weights = torch.randn(dim, dim).to(device)
-        self.hebbian_recurrent_weights = torch.randn(dim, dim).to(device)
+        # Hebbian weights and recurrent weights (combined for the entire layer)
+        self.hebbian_weights = torch.randn(total_dim, total_dim, device=self.device)
+        self.hebbian_recurrent_weights = torch.randn(total_dim, total_dim, device=self.device)
+    
+        # Randomized alpha and decay values for each dimension
+        self.alpha = torch.rand(total_dim, device=self.device) 
+        self.decay = torch.rand(total_dim, device=self.device) 
 
-        # Hebbian parameters (regular tensors)
-        self.alpha = torch.full((dim,), alpha_init).to(device)
-        self.decay = torch.full((dim,), decay_init).to(device)
+        # Layer normalization
+        self.layer_norm_activations = nn.LayerNorm(total_dim)
+        self.layer_norm_recurrent = nn.LayerNorm(total_dim)
 
-        # Layer normalization layers
-        self.layer_norm_activations = nn.LayerNorm(dim)
-        self.layer_norm_recurrent = nn.LayerNorm(dim)
+        # Initialize neuromodulator and expectation-reward networks
+        self.neuromodulator = Neuromodulator(total_dim, num_units)
 
         # Store previous activations
         self.previous_activation = None
@@ -167,312 +235,148 @@ class HebbianLayer(nn.Module):
 
         # Initialize previous activations if not set
         if self.previous_activation is None:
-            self.previous_activation = torch.zeros(batch_size, self.dim, device=self.device)
+            self.previous_activation = torch.zeros(batch_size, self.total_dim, device=self.device)
 
         # Compute recurrent output
         recurrent_input = self.previous_activation
-        recurrent_output = torch.matmul(recurrent_input, self.hebbian_recurrent_weights)  # Detach here
+        recurrent_output = torch.matmul(recurrent_input, self.hebbian_recurrent_weights)
+        recurrent_output = F.relu(recurrent_output)  # Apply ReLU after recurrent calculation
         recurrent_output_norm = self.layer_norm_recurrent(recurrent_output)
 
         # Compute activations
-        stimulus_output = torch.matmul(stimulus, self.hebbian_weights)  # Detach here
-        final_output = F.relu(stimulus_output + recurrent_output_norm)
-        final_output = self.layer_norm_activations(final_output)
+        stimulus_output = torch.matmul(stimulus, self.hebbian_weights)
+        stimulus_output = F.relu(stimulus_output)  # Apply ReLU after stimulus calculation
+        final_output = stimulus_output + recurrent_output_norm
 
         # Update previous activations
-        self.previous_activation = final_output.detach()  # Prevent backprop through activations
+        self.previous_activation = final_output.detach()
+
+        # Apply neuromodulator
+        dopamine_signals = self.neuromodulator(final_output)  # Shape: (num_units,)
+        expanded_dopamine_signals = dopamine_signals.repeat_interleave(self.total_dim // self.num_units)
+        self.alpha = expanded_dopamine_signals * ALPHA_SCALE # Modulate alpha
 
         # Perform Hebbian update
         self.hebbian_update(recurrent_input, recurrent_output, stimulus, stimulus_output)
 
+        # return final_output, estimated_batch_loss
         return final_output
 
     def hebbian_update(self, recurrent_input, recurrent_output, stimulus, stimulus_output):
-        # Standard Hebbian update rule
-        hebbian_updates = torch.einsum('bi,bj->ij', stimulus, stimulus_output)
-        recurrent_updates = torch.einsum('bi,bj->ij', recurrent_input, recurrent_output)
-
+        # Perform the outer product using broadcasting and bmm
+        hebbian_updates = stimulus.unsqueeze(-1) * stimulus_output.unsqueeze(-2)  # (batch_size, total_dim, total_dim)
+        recurrent_updates = recurrent_input.unsqueeze(-1) * recurrent_output.unsqueeze(-2)  # (batch_size, total_dim, total_dim)
+        
+        # Sum across the batch dimension
+        hebbian_updates = hebbian_updates.sum(dim=0)  # Sum over batch to get (total_dim, total_dim)
+        recurrent_updates = recurrent_updates.sum(dim=0)  # Sum over batch
+        
         # Modulate updates with alpha (learning rate)
         modulated_hebbian_updates = hebbian_updates * self.alpha.unsqueeze(0)
         modulated_recurrent_updates = recurrent_updates * self.alpha.unsqueeze(0)
 
         # Apply updates to weights and recurrent weights
-        new_hebbian_weights = self.hebbian_weights + modulated_hebbian_updates
-        new_recurrent_weights = self.hebbian_recurrent_weights + modulated_recurrent_updates
+        self.hebbian_weights = self.hebbian_weights + modulated_hebbian_updates
+        self.hebbian_recurrent_weights = self.hebbian_recurrent_weights + modulated_recurrent_updates
 
         # Apply decay to weights
-        decay_matrix = torch.diag(self.decay).to(self.device)
-        new_hebbian_weights -= torch.matmul(decay_matrix, self.hebbian_weights)
-        new_recurrent_weights -= torch.matmul(decay_matrix, self.hebbian_recurrent_weights)
+        decay_matrix = torch.diag(self.decay)
+        self.hebbian_weights = self.hebbian_weights - torch.matmul(decay_matrix, self.hebbian_weights)
+        self.hebbian_recurrent_weights = self.hebbian_recurrent_weights - torch.matmul(decay_matrix, self.hebbian_recurrent_weights)
 
         # Normalize weights
-        new_hebbian_weights = F.normalize(new_hebbian_weights, p=2, dim=1)
-        new_recurrent_weights = F.normalize(new_recurrent_weights, p=2, dim=1)
+        self.hebbian_weights = F.normalize(self.hebbian_weights, p=2, dim=1)
+        self.hebbian_recurrent_weights = F.normalize(self.hebbian_recurrent_weights, p=2, dim=1)
 
-        # Update weights
-        self.hebbian_weights = new_hebbian_weights.detach()
-        self.hebbian_recurrent_weights = new_recurrent_weights.detach()
-
-
-# 5. SubNetwork
-class SubNetwork(nn.Module):
-    def __init__(self, dim, num_layers, memory_type="short"):
-        super(SubNetwork, self).__init__()
-        self.layers = nn.ModuleList()
-        for _ in range(num_layers):
-            if memory_type == "short":
-                scaling = torch.FloatTensor(1).uniform_(0.1, 1).item()  # Higher alpha
-                decay = torch.FloatTensor(1).uniform_(0.01, 0.05).item()  # Higher decay
-            else:  # long-term memory
-                scaling = torch.FloatTensor(1).uniform_(0.01, 0.1).item()  # Lower alpha
-                decay = torch.FloatTensor(1).uniform_(0.001, 0.01).item()  # Lower decay
-            self.layers.append(HebbianLayer(dim, scaling, decay))
-
-    def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
-        return x
-
-class NeuromodulatorNetwork(nn.Module):
-    def __init__(self, input_dim, num_subnetworks):
-        super(NeuromodulatorNetwork, self).__init__()
-        hidden_dims = [256, 128]
-        self.num_subnetworks = num_subnetworks
-        self.fc = FullyConnected(input_dim, hidden_dims, num_subnetworks)  # Output 1 dopamine signal per subnetwork
-        self.tanh = nn.Tanh()  # Output will be restricted between -1 and 1
-
-    def forward(self, activations):
-        dopamine_signals = self.fc(activations.detach())  # Shape: (batch_size, num_subnetworks)
-        return self.tanh(dopamine_signals.mean(dim=0))  # Dopamine signals per subnetwork, Averaging across batch dimension, final shape: (num_subnetworks,)
-
-class ExpectationRewardNetwork(nn.Module):
-    def __init__(self, input_dim, num_subnetworks, device='cuda'):
-        super(ExpectationRewardNetwork, self).__init__()
-        # input_dim will include both activations and dopamine signals from all subnetworks
-        total_input_dim = input_dim + num_subnetworks  # Add the number of dopamine signals to input dimension
-        hidden_dims = [256, 128]  # Can be adjusted based on the use case
+# Neural Memory Class
+class NeuralMemory(nn.Module):
+    def __init__(self, num_layers, device='cuda'):
+        super(NeuralMemory, self).__init__()
         
-        # Fully connected layers for the expectation-reward prediction
-        self.fc = FullyConnected(total_input_dim, hidden_dims, 1)  # Output a scalar reward prediction
-        self.device = device
-
-    def forward(self, activations, dopamine_signals):
-        # Concatenate activations and dopamine signals for all subnetworks
-        activations = activations.detach()
-        batch_size = activations.size(0)
-
-        dopamine_signals = dopamine_signals.repeat(batch_size, 1)  # Shape: (batch_size, num_subnetworks)
-        combined_input = torch.cat([activations, dopamine_signals], dim=-1)  # Shape: (batch_size, input_dim + num_subnetworks)
-        
-        # Pass through the fully connected layers to predict reward
-        reward_prediction = self.fc(combined_input)
-        return reward_prediction.mean(dim=0)
-
-
-# 7. Neural Memory Network
-class NeuralMemoryNetwork(nn.Module):
-    def __init__(self, num_subnetworks, num_layers, device='cuda'):
-        super(NeuralMemoryNetwork, self).__init__()
-        self.subnetworks = nn.ModuleList()
-        self.hidden_size = INTERNAL_DIM // num_subnetworks
-        assert INTERNAL_DIM % num_subnetworks == 0, "INTERNAL_DIM must be divisible by num_subnetworks"
-        self.num_subnetworks = num_subnetworks
-        self.num_layers = num_layers
-        for _ in range(num_subnetworks):
-            # Randomly decide if the subnetwork is long-term or short-term
-            memory_type = "long" if random.random() < LONG_SHORT_TERM_PROB else "short"
-            self.subnetworks.append(SubNetwork(self.hidden_size, num_layers, memory_type))
-
-        self.output_layer = nn.Linear(INTERNAL_DIM, INTERNAL_DIM)
-        self.layer_norm = nn.LayerNorm(INTERNAL_DIM)  # Apply layer normalization
-
-        self.prev_loss = None
-        self.activations = None
-
-        # Initialize neuromodulator and expectation-reward networks
-        self.neuromodulator = NeuromodulatorNetwork(INTERNAL_DIM, num_subnetworks)  # One dopamine signal per subnetwork
-        self.expectation_reward_network = ExpectationRewardNetwork(INTERNAL_DIM, num_subnetworks)  # Takes activations + dopamine
-        self.dopamine_signals = None  # Cache dopamine signals
-
-        self.device = device
-
-
-    def update_neural_modulators(self):
-        """
-        This function will be called before the forward pass to modulate alpha values of each subnetwork.
-        The dopamine signals are computed using the neuromodulator network based on the activations of the previous step.
-        """
-        if self.activations is not None:
-            # Compute dopamine signals using the neuromodulator network
-            self.dopamine_signals = self.neuromodulator(self.activations)  # (batch_size, num_subnetworks)
-
-            # Update alpha values in each subnetwork's Hebbian layers
-            for i, subnetwork in enumerate(self.subnetworks):
-                for layer in subnetwork.layers:
-                    # Use no_grad to perform in-place updates without affecting autograd
-                    with torch.no_grad():
-                        # layer.alpha += self.dopamine_signals[i]  # Modulate alpha with dopamine signal
-                        layer.alpha = layer.alpha + self.dopamine_signals[i]
-
-        else:
-            # Initialize dopamine signals as zeros if this is the first step
-            self.dopamine_signals = torch.zeros(1, self.num_subnetworks, device=self.device)
-
-
-    def forward(self, x):
-        batch_size = x.size(0)  # (batch_size, INTERNAL_DIM)
-        x_splits = x.split(self.hidden_size, dim=-1)  # List of (batch_size, hidden_size) tensors
-        activations_of_all_subnetworks = []
-
-        for i, subnetwork in enumerate(self.subnetworks):
-            activations = subnetwork(x_splits[i])  # (batch_size, hidden_size)
-            activations_of_all_subnetworks.append(activations)
-
-        # Combine final activations for the final output
-        combined_activations = torch.cat(activations_of_all_subnetworks, dim=-1)  # (batch_size, INTERNAL_DIM)
-        
-        # Use combined activations to generate the final output
-        final_output = self.output_layer(combined_activations)  # (batch_size, INTERNAL_DIM)
-        final_output = self.layer_norm(final_output)  # (batch_size, INTERNAL_DIM)
-        self.activations = final_output
-        return final_output
-    
-    def compute_expected_reward(self):
-        # Use the expectation-reward network to compute the predicted quality of the dopamine signals
-        predicted_reward = self.expectation_reward_network(self.activations, self.dopamine_signals)
-        return predicted_reward
-    
-# 10. Attention Module
-class AttentionModule(nn.Module):
-    def __init__(self, embed_dim, num_heads):
-        super(AttentionModule, self).__init__()
-        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads)
-
-    def forward(self, query_input, key_value_inputs):
-        # Prepare for attention mechanism
-        key_value_tensor = torch.stack(key_value_inputs)  # Shape: (num_sources, batch_size, internal_dim)
-        # Query input
-        query = query_input.unsqueeze(0)  # Shape: (1, batch_size, internal_dim)
-        
-
-        # print(key_value_tensor.shape, query.shape)
-        # Apply attention with query input, and key_value_inputs as key and value
-        attn_output, _ = self.attention(query, key_value_tensor, key_value_tensor)
-        
-        # Remove the singleton dimension from the output
-        attn_output = attn_output.squeeze(0)  # Shape: (batch_size, internal_dim)
-
-        return attn_output
-
-# 11. Brain
-class Brain(nn.Module):
-    def __init__(self):
-        super(Brain, self).__init__()
-
-        self.fovea_loc_pred = FoveaPosPredictor()
-        self.vision_encoder = VisionEncoder()
-
-        # Neural memory networks
-        self.neural_memory_networks = nn.ModuleList([
-            NeuralMemoryNetwork(
-                num_subnetworks=NUM_SUB_NETWORKS,
-                num_layers=NUM_LAYERS,
-            ) for _ in range(NUM_MEMORY_NETWORKS)
+        # Define hebbian layers in memory network
+        self.hebbian_layers = nn.ModuleList([
+            HebbianLayer(TOTAL_DIM, NUM_UNITS, device=device)
+            for _ in range(num_layers)
         ])
 
-        # Attention mechanism
-        self.attention = AttentionModule(embed_dim=INTERNAL_DIM, num_heads=4)
-        # Linear layer to project positional encoding to match INTERNAL_DIM
-        self.positional_encoder = nn.Linear(8, INTERNAL_DIM)  # 8: 2 for coordinates, 6 for one-hot image index
-        # LayerNorm for peripheral and fovea encodings after positional encoding
-        self.peripheral_norm = nn.LayerNorm(INTERNAL_DIM)
-        self.fovea_norm = nn.LayerNorm(INTERNAL_DIM)
+    def forward(self, x):
+        # Step 1: Replicate input to match TOTAL_DIM
+        x = x.repeat_interleave(NUM_SUBNETWORKS, dim=-1)  # Shape: (batch_size, TOTAL_DIM)
 
-    def update_neural_modulators(self):
-        """Update the neuromodulators for each NMN before the forward pass."""
-        for nmn in self.neural_memory_networks:
-            nmn.update_neural_modulators()
+        # Step 2: Pass through each Hebbian layer and accumulate the estimated loss
+        all_layer_outputs = []
+        
+        for layer in self.hebbian_layers:
+            x = layer(x)
+            # Split the output of this Hebbian layer into segments of size INTERNAL_DIM
+            layer_outputs = torch.split(x, INTERNAL_DIM, dim=-1)  # List of (batch_size, INTERNAL_DIM) tensors
+            all_layer_outputs.extend(layer_outputs)  # Collect all segments
+            
+        return all_layer_outputs
 
-    def get_predicted_dopamine_quality(self):
-        """Get the predicted dopamine signal quality for each NMN."""
-        dopamine_qualities = []
-        for nmn in self.neural_memory_networks:
-            dopamine_quality = nmn.compute_expected_reward()  # Returns the predicted quality of dopamine signals
-            dopamine_qualities.append(dopamine_quality)
-        return torch.stack(dopamine_qualities)
-    
-    
+
+# Brain Class
+class Brain(nn.Module):
+    def __init__(self, device='cuda'):
+        super(Brain, self).__init__()
+        self.device = device
+
+        # self.fovea_loc_pred = FoveaPosPredictor()
+        self.vision_encoder = VisionEncoder()
+
+        # Initialize neural memory networks
+        self.neural_memory_networks = nn.ModuleList([
+            NeuralMemory(num_layers=NUM_LAYERS)
+            for _ in range(NUM_MEMORY_NETWORKS)
+        ])
+
     def forward(self, imgs, cls_tokens):
-        batch_size = imgs[0].size(0)
-
-        # Process peripheral vision for all images
-        peripheral_encodings = []
-        for i, img in enumerate(imgs):
-            peripheral_encoding = self.vision_encoder.forward_peripheral(img)
-            zero_fovea_coords = torch.zeros(batch_size, 2, device=img.device)
-            selected_img_idx = torch.full((batch_size,), i, device=img.device, dtype=torch.long)
-            pos_encoding = self.add_positional_encoding(zero_fovea_coords, selected_img_idx)
-            peripheral_encoding = self.peripheral_norm(peripheral_encoding + pos_encoding)
-            peripheral_encodings.append(peripheral_encoding)
-
-        # Combine peripheral encodings with attention
-        peripheral_combined = self.attention(peripheral_encodings[0], peripheral_encodings[1:])
-
-        # Run NMNs in parallel using torch.jit.fork
-        futures = [torch.jit.fork(nmn, peripheral_combined) for nmn in self.neural_memory_networks]
+        self.clear_gradients()  # Clear gradients before processing each new batch
+        self.reset_memory()     # Reset memory and estimated batch losses at the start of each forward pass
+        latest_memory_outputs = []
         
-        # Collect outputs from all NMNs
-        memory_outputs = [torch.jit.wait(future) for future in futures]
+        # Step 1: Calculate peripheral encodings
+        peripheral_encodings = self.vision_encoder.forward_peripheral(imgs)  # Returns a list of peripheral encodings
 
-        # Process fovea vision with CLS tokens
-        fovea_encodings = []
-        for i, cls in enumerate(cls_tokens):
-            if i == 0:
-                fovea_coords_logits, img_selector_logits = self.fovea_loc_pred(peripheral_combined, cls)
-            else:
-                fovea_coords_logits, img_selector_logits = self.fovea_loc_pred(fovea_encodings[-1], cls)
+        # Step 2: Process each peripheral encoding through neural memory networks
+        for peripheral_encoding in peripheral_encodings:
+            # print("periph enc in brain: ", peripheral_encoding.shape, peripheral_encoding.mean())
+            latest_memory_outputs = []
+            for nmn in self.neural_memory_networks:
+                nmn_output = nmn(peripheral_encoding)
+                latest_memory_outputs.extend(nmn_output)  # Collect all memory outputs for current peripheral encoding
+            # print("neural memory periph: ", len(latest_memory_outputs), latest_memory_outputs[0].mean())
+        # Step 3: For each CLS token, apply global pooling on memory outputs and pass through forward_fovea
+        for cls_token in cls_tokens:
+            # Global pooling (average pooling here) over the memory outputs to get a compact representation
+            pooled_memory_output = F.normalize(torch.stack(latest_memory_outputs, dim=0)).mean(dim=0)
+            # print("pooled memory: ", pooled_memory_output.shape, pooled_memory_output.mean())
+            # Step 4: Pass pooled memory output and cls_token into forward_fovea to get the fovea encoding
+            fovea_encoding = self.vision_encoder.forward_fovea(pooled_memory_output, cls_token)
+            # print("fovea enc in brain: ", fovea_encoding.shape, fovea_encoding.mean())
 
-            img_selector_probs = F.softmax(img_selector_logits, dim=-1)
-            selected_img_idx = torch.argmax(img_selector_probs, dim=-1)
+            # Step 5: Clear the latest memory outputs, replace with the new fovea encoding, and repeat the process
+            latest_memory_outputs = []
+            for nmn in self.neural_memory_networks:
+                nmn_output = nmn(fovea_encoding)
+                latest_memory_outputs.extend(nmn_output)
 
-            # Select images based on predicted index
-            selected_img = torch.cat([
-                imgs[selected_img_idx[b].item()][b].unsqueeze(0) for b in range(batch_size)
-            ], dim=0)
+            # print("neural memory fovea: ", len(latest_memory_outputs), latest_memory_outputs[0].mean())
 
-            fovea_encoding = self.vision_encoder.forward_fovea(selected_img, fovea_coords_logits)
-            fovea_encoding_with_pos = self.fovea_norm(
-                fovea_encoding + self.add_positional_encoding(fovea_coords_logits, selected_img_idx)
-            )
-            fovea_encodings.append(fovea_encoding_with_pos)
+        # Return the final memory outputs after all CLS tokens have been processed
+        return torch.stack(latest_memory_outputs, dim=1)
 
-            # Run fovea encoding through NMNs and collect results
-            fovea_futures = [torch.jit.fork(nmn, fovea_encoding_with_pos) for nmn in self.neural_memory_networks]
-            fovea_memory_outputs = [torch.jit.wait(future) for future in fovea_futures]
-            memory_outputs.extend(fovea_memory_outputs)
-
-        # Stack all memory network outputs along a new sequence dimension
-        final_output = torch.stack(memory_outputs, dim=1)
-
-        return final_output
-
-    def add_positional_encoding(self, fovea_coords, selected_img_idx):
-        # Add positional encoding for the fovea coordinates and selected image index
-        batch_size = fovea_coords.size(0)
-
-        # Ensure selected_img_idx is a tensor
-        selected_img_idx = selected_img_idx.unsqueeze(-1)  # Ensure it has the right dimensions
-        
-        # One-hot encode the selected image index and remove the extra dimension (from 3D to 2D)
-        one_hot_img_idx = F.one_hot(selected_img_idx, num_classes=6).float().squeeze(1)  # Shape: (batch_size, 6)
-
-        # Combine fovea coordinates with the selected image index (one-hot encoded)
-        fovea_encoding_pos = torch.cat([
-            fovea_coords,  # Fovea coordinates as position (2D)
-            one_hot_img_idx  # One-hot encode the selected image index (6 images)
-        ], dim=-1)  # Final size: (batch_size, 8)
-
-        # Project positional encoding to the same dimension as INTERNAL_DIM
-        positional_encoding_proj = self.positional_encoder(fovea_encoding_pos)  # Shape: (batch_size, INTERNAL_DIM)
-
-        return positional_encoding_proj
+    def reset_memory(self):
+        """Reset previous activations in each Hebbian layer across all memory networks."""
+        for nmn in self.neural_memory_networks:
+            for layer in nmn.hebbian_layers:
+                layer.previous_activation = None
+    
+    def clear_gradients(self):
+        """Clear gradients efficiently by zeroing gradients without detaching entire tensors."""
+        for nmn in self.neural_memory_networks:
+            for layer in nmn.hebbian_layers:
+                # Check and clear gradients if they exist, avoiding full detachment
+                layer.alpha = layer.alpha.detach()
+                layer.hebbian_weights = layer.hebbian_weights.detach()
+                layer.hebbian_recurrent_weights = layer.hebbian_recurrent_weights.detach()

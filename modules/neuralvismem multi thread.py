@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import random
+import torch.jit
 
 # Define the input and output dimensions for internal modules
 INTERNAL_DIM = 768
@@ -220,8 +221,8 @@ class SubNetwork(nn.Module):
         self.layers = nn.ModuleList()
         for _ in range(num_layers):
             if memory_type == "short":
-                scaling = torch.FloatTensor(1).uniform_(1.0, 20.0).item()  # Higher alpha
-                decay = torch.FloatTensor(1).uniform_(0.05, 0.35).item()  # Higher decay
+                scaling = torch.FloatTensor(1).uniform_(0.1, 1).item()  # Higher alpha
+                decay = torch.FloatTensor(1).uniform_(0.01, 0.05).item()  # Higher decay
             else:  # long-term memory
                 scaling = torch.FloatTensor(1).uniform_(0.01, 0.1).item()  # Lower alpha
                 decay = torch.FloatTensor(1).uniform_(0.001, 0.01).item()  # Lower decay
@@ -309,8 +310,10 @@ class NeuralMemoryNetwork(nn.Module):
             for i, subnetwork in enumerate(self.subnetworks):
                 for layer in subnetwork.layers:
                     # Use no_grad to perform in-place updates without affecting autograd
-                    # with torch.no_grad():
-                        layer.alpha = layer.alpha + self.dopamine_signals[i].clone().detach()
+                    with torch.no_grad():
+                        # layer.alpha += self.dopamine_signals[i]  # Modulate alpha with dopamine signal
+                        layer.alpha = layer.alpha + self.dopamine_signals[i]
+
         else:
             # Initialize dopamine signals as zeros if this is the first step
             self.dopamine_signals = torch.zeros(1, self.num_subnetworks, device=self.device)
@@ -398,39 +401,32 @@ class Brain(nn.Module):
             dopamine_qualities.append(dopamine_quality)
         return torch.stack(dopamine_qualities)
     
+    
     def forward(self, imgs, cls_tokens):
-        batch_size = imgs[0].size(0)  # Get batch size from the first image
+        batch_size = imgs[0].size(0)
 
-        # Process peripheral vision for all images with positional encoding
+        # Process peripheral vision for all images
         peripheral_encodings = []
         for i, img in enumerate(imgs):
             peripheral_encoding = self.vision_encoder.forward_peripheral(img)
-
-            # Use 0s for fovea coordinates as a placeholder
             zero_fovea_coords = torch.zeros(batch_size, 2, device=img.device)
-
-            # Create a tensor for the selected image index, shaped (batch_size,)
             selected_img_idx = torch.full((batch_size,), i, device=img.device, dtype=torch.long)
-
-            # Add positional encoding and normalize
             pos_encoding = self.add_positional_encoding(zero_fovea_coords, selected_img_idx)
-            peripheral_encoding = peripheral_encoding + pos_encoding
-            peripheral_encoding = self.peripheral_norm(peripheral_encoding)  # Apply LayerNorm
-
+            peripheral_encoding = self.peripheral_norm(peripheral_encoding + pos_encoding)
             peripheral_encodings.append(peripheral_encoding)
 
         # Combine peripheral encodings with attention
         peripheral_combined = self.attention(peripheral_encodings[0], peripheral_encodings[1:])
 
-        # Store memory network outputs
-        final_outputs_of_all_memory_networks = [
-            nmn(peripheral_combined) for nmn in self.neural_memory_networks
-        ]
+        # Run NMNs in parallel using torch.jit.fork
+        futures = [torch.jit.fork(nmn, peripheral_combined) for nmn in self.neural_memory_networks]
+        
+        # Collect outputs from all NMNs
+        memory_outputs = [torch.jit.wait(future) for future in futures]
 
-        # Process fovea vision using CLS tokens
+        # Process fovea vision with CLS tokens
         fovea_encodings = []
         for i, cls in enumerate(cls_tokens):
-            # Predict fovea coordinates and the target image index
             if i == 0:
                 fovea_coords_logits, img_selector_logits = self.fovea_loc_pred(peripheral_combined, cls)
             else:
@@ -439,31 +435,26 @@ class Brain(nn.Module):
             img_selector_probs = F.softmax(img_selector_logits, dim=-1)
             selected_img_idx = torch.argmax(img_selector_probs, dim=-1)
 
-            # Select images for each batch element based on predicted index
+            # Select images based on predicted index
             selected_img = torch.cat([
                 imgs[selected_img_idx[b].item()][b].unsqueeze(0) for b in range(batch_size)
             ], dim=0)
-            
-            # Process fovea encoding using the selected image
+
             fovea_encoding = self.vision_encoder.forward_fovea(selected_img, fovea_coords_logits)
-
-            # Add positional encoding and normalize
-            fovea_encoding_with_pos = fovea_encoding + self.add_positional_encoding(
-                fovea_coords_logits, selected_img_idx
+            fovea_encoding_with_pos = self.fovea_norm(
+                fovea_encoding + self.add_positional_encoding(fovea_coords_logits, selected_img_idx)
             )
-            fovea_encoding_with_pos = self.fovea_norm(fovea_encoding_with_pos)  # Apply LayerNorm
-
             fovea_encodings.append(fovea_encoding_with_pos)
 
-            # Pass the fovea encoding through memory networks
-            for nmn in self.neural_memory_networks:
-                nmn_output = nmn(fovea_encoding_with_pos)
-                final_outputs_of_all_memory_networks.append(nmn_output)
+            # Run fovea encoding through NMNs and collect results
+            fovea_futures = [torch.jit.fork(nmn, fovea_encoding_with_pos) for nmn in self.neural_memory_networks]
+            fovea_memory_outputs = [torch.jit.wait(future) for future in fovea_futures]
+            memory_outputs.extend(fovea_memory_outputs)
 
-        # Stack all memory network outputs along a sequence dimension
-        final_outputs_of_all_memory_networks = torch.stack(final_outputs_of_all_memory_networks, dim=1)
+        # Stack all memory network outputs along a new sequence dimension
+        final_output = torch.stack(memory_outputs, dim=1)
 
-        return final_outputs_of_all_memory_networks
+        return final_output
 
     def add_positional_encoding(self, fovea_coords, selected_img_idx):
         # Add positional encoding for the fovea coordinates and selected image index

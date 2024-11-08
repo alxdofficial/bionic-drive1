@@ -2,7 +2,8 @@ import argparse
 import pdb
 
 import torch
-
+from pycocotools.coco import COCO
+from pycocoevalcap.eval import COCOEvalCap
 import os
 from modules.dataset import Dataset
 from modules.model_t5 import DriveT5VisionModel
@@ -31,7 +32,6 @@ def inference(dloader):
     with torch.no_grad():
         for idx, (q_texts, a_texts, encodings, imgs, labels, img_paths) in progress_bar(enumerate(dloader), total=len(dloader)):
                 with torch.no_grad():
-                    model.image_processor.visual_embedding_module.update_neural_modulators()
                     outputs = model.generate(encodings, imgs)
                     text_outputs = [processor.decode(output, skip_special_tokens=True) for output in outputs]
 
@@ -53,11 +53,6 @@ def inference(dloader):
                     #         generated_answer=text_outputs[i], 
                     #         true_answer=processor.decode(labels[i], skip_special_tokens=True)
                     #     )
-
-                    # Visualize Hebbian layer weights
-                    if (idx + 1) % 20 == 0 or  idx == 0:
-                        visnum += 1
-                        visualize_memory(model, frame_number=visnum)
 
                     # call metrics fun
                     metrics(text_outputs, a_texts)
@@ -96,35 +91,30 @@ if __name__ == '__main__':
     
     # Load the model from the checkpoint
     model= torch.load(
-        "multi_frame_results/20241023-214628/latest_model_11.pth"
+        "multi_frame_results/20241031-101245/latest_model_11.pth"
     )
 
-    for nmn in model.image_processor.visual_embedding_module.neural_memory_networks:
-        for subnet in nmn.subnetworks:
-            for layer in subnet.layers:
-                layer.previous_activation = None
-            
 
     # Move the model to the appropriate device
     model.to(device)
 
     
     # Load dataset and dataloader
-    test_dset = Dataset(
-        input_file=os.path.join('data2', 'inference',
-                                'filtered_sorted_multi_frame_val.json'),
-        tokenizer=processor,
-        transform=transforms.Compose([
-            transforms.Normalize((127.5, 127.5, 127.5), (127.5, 127.5, 127.5))
-        ])
-    )
-    # test_dset = Dataset( c
-    #     input_file="data/multi_frame/multi_frame_test.json",
+    # test_dset = Dataset(
+    #     input_file=os.path.join('data2', 'inference',
+    #                             'filtered_sorted_multi_frame_val.json'),
     #     tokenizer=processor,
     #     transform=transforms.Compose([
     #         transforms.Normalize((127.5, 127.5, 127.5), (127.5, 127.5, 127.5))
     #     ])
     # )
+    test_dset = Dataset(
+        input_file="data/multi_frame/multi_frame_test.json",
+        tokenizer=processor,
+        transform=transforms.Compose([
+            transforms.Normalize((127.5, 127.5, 127.5), (127.5, 127.5, 127.5))
+        ])
+    )
 
     # test_dloader = DataLoader(test_dset, shuffle=False, batch_size=config.batch_size, drop_last=True,
     #                           collate_fn=test_dset.test_collate_fn)

@@ -6,24 +6,19 @@ import json
 import os
 import time
 from torch.utils.data import DataLoader
-import torch.nn.init as init
 import torch
-import torch.nn as nn
 import argparse
 from modules.dataset import Dataset
-from modules.model_t5 import print_trainable_parameters, DriveT5VisionModel
+from modules.model_t5_ablation import print_trainable_parameters, DriveT5VisionModel
 import matplotlib.pyplot as plt
 import pandas as pd
 from copy import deepcopy
 from tqdm import tqdm
 import gc
 from visualize import visualize_memory
-import random
-random.seed(2002)
-torch.cuda.manual_seed(2002)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(device)
+
 
 def save_model(model, model_name):
     # Save the model into the designated folder
@@ -70,18 +65,16 @@ def plot_loss(training_loss, val_loss):
     plt.savefig(os.path.join('multi_frame_results', timestr, 'loss.png'))
 
 
-def init_weights(layer):
-    if isinstance(layer, nn.Conv2d):
-        init.kaiming_normal_(layer.weight, mode='fan_out', nonlinearity='relu')
-        if layer.bias is not None:
-            init.constant_(layer.bias, 0)
-    elif isinstance(layer, nn.Linear):
-        init.kaiming_normal_(layer.weight, mode='fan_in', nonlinearity='relu')
-        if layer.bias is not None:
-            init.constant_(layer.bias, 0)
+def expectation_reward_criteria(batch_loss, predicted_quality):
+    """Calculates the difference between the negative of batch loss and predicted dopamine quality."""
+    return torch.abs(-batch_loss - predicted_quality)
 
+def neuromodulator_criteria(predicted_quality):
+    """Criteria for the neuromodulator, aiming to maximize the predicted dopamine quality."""
+    return -predicted_quality
 
 def train(train_loss, val_loss, best_model, epochs, learning_rate):
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9, last_epoch=-1, verbose=False)
 
@@ -91,14 +84,15 @@ def train(train_loss, val_loss, best_model, epochs, learning_rate):
         epoch_loss = 0
 
         for step, (inputs, imgs, labels) in tqdm(enumerate(train_dataloader), total=len(train_dataloader)):
+        # for step, (inputs, imgs, labels) in enumerate(train_dataloader):
             # if step % 100 == 0:
                 # print(step)
                 # visualize_memory(model, frame_number=i)
             if step % 50 == 0:
                 gc.collect()  # Collect garbage to free CPU memory
                 torch.cuda.empty_cache()  # Free up GPU memory
+            # print(inputs.shape, imgs.shape, labels.shape)
 
-            # Zero out gradients for all optimizers
             optimizer.zero_grad()
             # Forward pass through model
             outputs = model(inputs, imgs, labels)
@@ -108,13 +102,6 @@ def train(train_loss, val_loss, best_model, epochs, learning_rate):
             # Back-propogate
             loss.backward()
             optimizer.step()
-
-            # for name, param in model.named_parameters():
-            #     if param.grad is not None:
-            #         grad_mean = param.grad.mean().item()  # Min of current param's gradient
-            #         print(name, grad_mean)
-            #     else:
-            #         print(name, "None")
 
             if step % config.checkpoint_frequency == 0:
                 print(step)
@@ -169,7 +156,7 @@ def params():
     parser = argparse.ArgumentParser()
     parser.add_argument("--learning-rate", default=1e-4, type=float,
                         help="Model learning rate starting point, default is 1e-4.")
-    parser.add_argument("--batch-size", default=6, type=int,
+    parser.add_argument("--batch-size", default=8, type=int,
                         help="Batch size per GPU/CPU for training and evaluation, defaults to 8.")
     parser.add_argument("--epochs", default=12, type=int,
                         help="Number of epochs to train for, default is 15")
@@ -213,8 +200,6 @@ if __name__ == '__main__':
     cls_token_id = processor.convert_tokens_to_ids(cls_token)
     
     model = DriveT5VisionModel(config, tokenizer=processor)  # Pass the tokenizer here
-    model.image_processor.visual_embedding_module.apply(init_weights)
-
     model.to(device)
     print('Trainable Parameters for full model')
     print_trainable_parameters(model)
