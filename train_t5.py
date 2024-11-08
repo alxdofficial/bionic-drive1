@@ -103,7 +103,7 @@ def train(train_loss, val_loss, best_model, epochs, learning_rate):
             # Forward pass through model
             outputs = model(inputs, imgs, labels)
             # Calculate loss
-            loss = outputs.loss
+            loss = outputs.loss.mean()
             epoch_loss += loss.item()
             # Back-propogate
             loss.backward()
