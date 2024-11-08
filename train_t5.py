@@ -215,6 +215,11 @@ if __name__ == '__main__':
     model = DriveT5VisionModel(config, tokenizer=processor)  # Pass the tokenizer here
     model.image_processor.visual_embedding_module.apply(init_weights)
 
+    # If multiple GPUs are available, wrap the model in DataParallel
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs")
+        model = nn.DataParallel(model)
+
     model.to(device)
     print('Trainable Parameters for full model')
     print_trainable_parameters(model)
