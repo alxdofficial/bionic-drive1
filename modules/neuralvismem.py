@@ -85,7 +85,7 @@ class VisionEncoder(nn.Module):
         
         return full_concat_img
     
-    def grid_positional_encoding(self, grid_x, grid_y, device='cuda'):
+    def grid_positional_encoding(self, grid_x, grid_y):
         """
         Generate a grid-based positional encoding by normalizing grid_x and grid_y and replicating
         them to match INTERNAL_DIM.
@@ -98,6 +98,9 @@ class VisionEncoder(nn.Module):
         norm_x = grid_x / (self.grid_width - 1)
         norm_y = grid_y / (self.grid_height - 1)
 
+        # Use the device of the feature map to ensure compatibility
+        device = self.feature_map.device
+        
         # Create a tensor for positional encoding by replicating norm_x and norm_y
         pos_encoding = torch.tensor([norm_x, norm_y], device=device, dtype=torch.float32)
 
@@ -106,7 +109,8 @@ class VisionEncoder(nn.Module):
         remainder = INTERNAL_DIM % pos_encoding.shape[0]
         pos_encoding = torch.cat([pos_encoding.repeat(repeats), pos_encoding[:remainder]])
 
-        return pos_encoding  * POSITIONAL_ENCODING_SCALE # Shape: (INTERNAL_DIM,)
+        return pos_encoding * POSITIONAL_ENCODING_SCALE  # Shape: (INTERNAL_DIM,)
+
 
     def forward_peripheral(self, imgs):
         # Concatenate images in a 2x3 grid format
@@ -205,37 +209,36 @@ class Neuromodulator(nn.Module):
 
 # Updated Hebbian Layer Class
 class HebbianLayer(nn.Module):
-    def __init__(self, total_dim, num_units, device='cuda'):
+    def __init__(self, total_dim, num_units):
         super(HebbianLayer, self).__init__()
-        
+
         self.total_dim = total_dim
         self.num_units = num_units
-        self.device = device
 
-        # Hebbian weights and recurrent weights (combined for the entire layer)
-        self.hebbian_weights = torch.randn(total_dim, total_dim, device=self.device)
-        self.hebbian_recurrent_weights = torch.randn(total_dim, total_dim, device=self.device)
-    
+        # Hebbian weights and recurrent weights as buffers (not parameters)
+        self.register_buffer('hebbian_weights', torch.randn(total_dim, total_dim))
+        self.register_buffer('hebbian_recurrent_weights', torch.randn(total_dim, total_dim))
+
         # Randomized alpha and decay values for each dimension
-        self.alpha = torch.rand(total_dim, device=self.device) 
-        self.decay = torch.rand(total_dim, device=self.device) 
+        self.register_buffer('alpha', torch.rand(total_dim))
+        self.register_buffer('decay', torch.rand(total_dim))
 
         # Layer normalization
         self.layer_norm_activations = nn.LayerNorm(total_dim)
         self.layer_norm_recurrent = nn.LayerNorm(total_dim)
 
-        # Initialize neuromodulator and expectation-reward networks
+        # Initialize neuromodulator
         self.neuromodulator = Neuromodulator(total_dim, num_units)
 
         # Store previous activations
-        self.previous_activation = None
+        self.register_buffer('previous_activation', None)
 
     def forward(self, stimulus):
         batch_size = stimulus.size(0)
 
         # Initialize previous activations if not set
         if self.previous_activation is None:
-            self.previous_activation = torch.zeros(batch_size, self.total_dim, device=self.device)
+            self.previous_activation = torch.zeros(batch_size, self.total_dim, device=stimulus.device)
 
         # Compute recurrent output
         recurrent_input = self.previous_activation
@@ -290,12 +293,12 @@ class HebbianLayer(nn.Module):
 
 # Neural Memory Class
 class NeuralMemory(nn.Module):
-    def __init__(self, num_layers, device='cuda'):
+    def __init__(self, num_layers):
         super(NeuralMemory, self).__init__()
-        
+
         # Define hebbian layers in memory network
         self.hebbian_layers = nn.ModuleList([
-            HebbianLayer(TOTAL_DIM, NUM_UNITS, device=device)
+            HebbianLayer(TOTAL_DIM, NUM_UNITS)
             for _ in range(num_layers)
         ])
 
@@ -305,23 +308,22 @@ class NeuralMemory(nn.Module):
 
         # Step 2: Pass through each Hebbian layer and accumulate the estimated loss
         all_layer_outputs = []
-        
+
         for layer in self.hebbian_layers:
             x = layer(x)
             # Split the output of this Hebbian layer into segments of size INTERNAL_DIM
             layer_outputs = torch.split(x, INTERNAL_DIM, dim=-1)  # List of (batch_size, INTERNAL_DIM) tensors
             all_layer_outputs.extend(layer_outputs)  # Collect all segments
-            
+
         return all_layer_outputs
 
 
 # Brain Class
 class Brain(nn.Module):
-    def __init__(self, device='cuda'):
+    def __init__(self):
         super(Brain, self).__init__()
-        self.device = device
 
-        # self.fovea_loc_pred = FoveaPosPredictor()
+        # Vision encoder
         self.vision_encoder = VisionEncoder()
 
         # Initialize neural memory networks
