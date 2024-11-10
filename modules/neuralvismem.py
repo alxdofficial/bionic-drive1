@@ -8,9 +8,9 @@ IMG_HEIGHT = 900
 LONG_SHORT_TERM_PROB = 0.5
 INTERNAL_DIM = 768
 NUM_SUBNETWORKS = 1
-NUM_UNITS = 64
+NUM_UNITS = 32
 TOTAL_DIM = INTERNAL_DIM * NUM_SUBNETWORKS  # Calculate the total dimension
-NUM_LAYERS = 6
+NUM_LAYERS = 4
 NUM_MEMORY_NETWORKS = 4
 POSITIONAL_ENCODING_SCALE = 0.01
 ALPHA_BIAS = 0.1
@@ -111,7 +111,6 @@ class VisionEncoder(nn.Module):
 
         return pos_encoding * POSITIONAL_ENCODING_SCALE  # Shape: (INTERNAL_DIM,)
 
-
     def forward_peripheral(self, imgs):
         # Concatenate images in a 2x3 grid format
         concat_image = self.concatenate_images(imgs)  # Shape: (batch_size, 3, IMG_HEIGHT*2, IMG_WIDTH*3)
@@ -129,7 +128,7 @@ class VisionEncoder(nn.Module):
         # Calculate the positional encoding for each pooled vector and add it
         batch_size, channels, pooled_height, pooled_width = pooled_feature_map.size()
         pos_encoded_pooled_features = []
-
+    
         for row in range(pooled_height):
             for col in range(pooled_width):
                 # Calculate the center of the corresponding region in the original feature map

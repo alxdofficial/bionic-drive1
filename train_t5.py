@@ -142,30 +142,29 @@ def train(train_loss, val_loss, best_model, epochs, learning_rate):
         epoch_train_loss = epoch_loss / len(train_dataloader)
         losses.append(epoch_train_loss)
 
-        epoch_val_loss = val_model(val_dataloader, model)
-        val_losses.append(epoch_val_loss)
+        # epoch_val_loss = val_model(val_dataloader, model)
+        # val_losses.append(epoch_val_loss)
 
         # Adjust learning rate scheduler
         scheduler.step()
 
         print('Training Loss: ' + str(epoch_train_loss))
-        print('Validation Loss: ' + str(epoch_val_loss))
+        # print('Validation Loss: ' + str(epoch_val_loss))
         print('---------------------------------------------')
 
         # Save model and stats for checkpoints
-        save_model(model, f'latest_model_{epoch}')
+        save_model(model, f'model_{epoch}')
         epochs += 1
-        save_stats(train_loss, val_loss, epochs, scheduler.get_last_lr()[0])
+        # save_stats(train_loss, val_loss, epochs, scheduler.get_last_lr()[0])
         # plot the loss
-        plot_loss(losses, val_losses)
-    return train_loss, val_loss
+        # plot_loss(losses, val_losses)
 
 def params():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--learning-rate", default=1e-4, type=float,
                         help="Model learning rate starting point, default is 1e-4.")
-    parser.add_argument("--batch-size", default=6, type=int,
+    parser.add_argument("--batch-size", default=5, type=int,
                         help="Batch size per GPU/CPU for training and evaluation, defaults to 8.")
     parser.add_argument("--epochs", default=12, type=int,
                         help="Number of epochs to train for, default is 15")
@@ -286,6 +285,6 @@ if __name__ == '__main__':
     else:
         lr = config.learning_rate
 
-    min_train_loss, min_val_loss = train(min_train_loss, min_val_loss, best_model, epochs_ran, lr)
+    train(min_train_loss, min_val_loss, best_model, epochs_ran, lr)
 
 

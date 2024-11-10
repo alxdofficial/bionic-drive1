@@ -76,40 +76,29 @@ def visualize_memory(model, frame_number, output_dir="visualizations", mode="heb
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     
-    model = model.image_processor.visual_embedding_module
-    num_memory_networks = len(model.neural_memory_networks)
-    num_subnetworks = model.neural_memory_networks[0].num_subnetworks
-    num_layers = model.neural_memory_networks[0].num_layers
+    memory_module = model.image_processor.visual_embedding_module
+    num_memory_networks = len(memory_module.neural_memory_networks)
+    num_layers = len(memory_module.neural_memory_networks[0].hebbian_layers)  # Dynamically calculated
 
-    fig, axes = plt.subplots(num_memory_networks, num_subnetworks, figsize=(40, 40))
-    fig.suptitle(f'Weights Visualization for Frame {frame_number}', fontsize=10)
+    fig, axes = plt.subplots(num_memory_networks, num_layers, figsize=(25, 25))
+    fig.suptitle(f'Weights Visualization for Frame {frame_number}', fontsize=12)
 
-    for mem_idx, neural_memory_network in enumerate(model.neural_memory_networks):
-        for sub_idx, subnetwork in enumerate(neural_memory_network.subnetworks):
-            weight_grids = []
-            for layer in subnetwork.layers:
-                if mode == "hebbian":
-                    weights = layer.hebbian_weights.detach().cpu().numpy()
-                elif mode == "recurrent":
-                    weights = layer.hebbian_recurrent_weights.detach().cpu().numpy()
-                else:
-                    raise ValueError("visualize parameter must be 'hebbian' or 'recurrent'")
-                
-                weight_grids.append(weights)
-                
-            combined_weights = np.concatenate(weight_grids, axis=0)
+    for mem_idx, neural_memory_network in enumerate(memory_module.neural_memory_networks):
+        for layer_idx, layer in enumerate(neural_memory_network.hebbian_layers):
+            # Select weights based on the mode
+            if mode == "hebbian":
+                weights = layer.hebbian_weights.detach().cpu().numpy()
+            elif mode == "recurrent":
+                weights = layer.hebbian_recurrent_weights.detach().cpu().numpy()
+            else:
+                raise ValueError("mode must be 'hebbian' or 'recurrent'")
 
             # Normalize weights to 0-255
-            combined_weights = normalize_to_255(combined_weights)
-
-            ax = axes[mem_idx, sub_idx]
-            img = ax.imshow(combined_weights, aspect='auto', cmap='viridis')
-            ax.set_title(f'Memory {mem_idx+1}, Subnet {sub_idx+1}', fontsize=8)
-            ax.tick_params(axis='both', which='both', labelsize=6)
-    
-    # # Add color legend
-    # cbar = fig.colorbar(img, ax=axes.ravel().tolist(), shrink=0.95)
-    # cbar.set_label('Weight Intensity (0-255)', fontsize=10)
+            normalized_weights = normalize_to_255(weights)
+            ax = axes[mem_idx, layer_idx]
+            ax.imshow(normalized_weights, aspect='auto', cmap='viridis')
+            ax.set_title(f'Memory {mem_idx+1}, Layer {layer_idx+1}', fontsize=8)
+            ax.axis('off')
 
     plt.tight_layout()
     output_path = os.path.join(output_dir, f'{mode}_weights_frame_{frame_number}.png')
